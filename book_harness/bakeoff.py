@@ -174,7 +174,7 @@ def _judge_client(settings: Any, judge_model: str | None) -> Any:
         client = build_client(
             settings.ollama_host,
             timeout=settings.ollama_timeout,
-            preferred=config.ASSIST_MODELS,
+            preferred=config.QE_MODELS,
             api=settings.api,
             api_key=settings.api_key,
             model=judge_model,

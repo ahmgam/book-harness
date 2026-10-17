@@ -148,11 +148,17 @@ shape to the pipeline's, so nothing downstream changes.
 
 ## Configuration
 
+All configuration is environment-first; see [`.env.example`](./.env.example)
+for every variable with its default (model server URL/wire protocol, API
+key, role-based model preference lists, runs root, arabterm cache dir).
+
 | Env var | Effect |
 |---|---|
 | `BOOK_HARNESS_RUNS` | runs root for `get_glossary` / `list_runs` (default `./runs`) |
 | `OLLAMA_HOST` | model server base URL for `translate_chunk` (default `http://localhost:11434`); a URL ending in `/v1` switches to the OpenAI-compatible wire protocol |
 | `BOOK_HARNESS_API` | force the wire protocol: `auto` (default) \| `ollama` \| `openai` |
+| `BOOK_HARNESS_TRANSLATION_MODEL(S)` | model preference list for the translation role (MCP `translate_chunk`) |
+| `BOOK_HARNESS_ASSIST_MODEL(S)` / `BOOK_HARNESS_QE_MODEL(S)` | role overrides for instruct jobs; translation list is inherited by default |
 | `OPENAI_API_KEY` | Bearer key sent to OpenAI-compatible endpoints |
 | `BOOK_HARNESS_OLLAMA_TIMEOUT` | seconds per generate call (default 900) |
 

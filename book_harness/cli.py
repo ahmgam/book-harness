@@ -139,13 +139,30 @@ def _drafts_meta(settings: Settings) -> dict[str, dict]:
     return drafts.meta_by_chunk
 
 
-def _assist_client(settings: Settings):
+def _translation_client(settings: Settings) -> Any:
+    """MT-role client: chunk translation / re-translation; honours the
+    ``BOOK_HARNESS_TRANSLATION_*`` role envs (see config.TRANSLATION_MODELS)."""
     from book_harness.translate import build_client
 
     return build_client(
         settings.ollama_host,
         timeout=settings.ollama_timeout,
-        preferred=config.ASSIST_MODELS,
+        preferred=config.TRANSLATION_MODELS,
+        api=settings.api,
+        api_key=settings.api_key,
+        model=settings.model,
+    )
+
+
+def _assist_client(settings: Settings, preferred: list[str] | None = None) -> Any:
+    """Instruct-role client (suffix/verify/judging); ``preferred`` narrows a
+    sub-role (e.g. ``config.QE_MODELS`` for the QE judge)."""
+    from book_harness.translate import build_client
+
+    return build_client(
+        settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        preferred=preferred or config.ASSIST_MODELS,
         api=settings.api,
         api_key=settings.api_key,
         model=settings.model,          # explicit model also steers QA roles
@@ -201,7 +218,7 @@ def stage_qe(settings: Settings, chunks: list) -> dict[str, dict]:
         if not comet.available:
             raise RuntimeError("qe-method=comet but the comet stack is unavailable")
     client = None if comet and comet.available and settings.qe_method == "comet" \
-        else _assist_client(settings)
+        else _assist_client(settings, preferred=config.QE_MODELS)
     effective_method = (
         settings.qe_method if settings.qe_method != "auto"
         else ("comet" if comet and comet.available else "judge")
@@ -322,7 +339,7 @@ def stage_compliance(settings: Settings, chunks: list, entries: list[dict]) -> l
     # Targeted re-translation (2.4): violated terms become a hard emphasis and
     # enter the cache key, so only violating chunks are regenerated.
     drafts_dir = settings.stage_dir(stage="drafts")
-    client = _assist_client(settings)
+    client = _translation_client(settings)
     summaries = SummaryTracker(
         client,
         drafts_dir / "chapter-summary.json",

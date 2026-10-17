@@ -318,6 +318,14 @@ python -m venv .venv && .venv/bin/pip install -e ".[tests]"
 .venv/bin/book-harness run path/to/ocr_main.json [options]
 ```
 
+For serving/role configuration, copy [`.env.example`](./.env.example) to
+`.env`, edit, and export it before running (the project doesn't auto-load
+`.env` files):
+
+```bash
+set -a; source .env; set +a      # bash/zsh
+```
+
 Key options: `--model` (force an installed model), `--domains aerospace`,
 `--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after
 chunking), `--no-drift`/`--no-artifacts` (M3 stages).
@@ -337,4 +345,21 @@ selection is identical in both protocols: the first of the
 ```bash
 book-harness run ocr.json --ollama-host http://vllm:8000/v1 --model Qwen/Qwen3.5-27B   # OpenAI-compatible
 book-harness run ocr.json                                        # plain Ollama, unchanged
+```
+
+#### Role assignment via env
+
+Model roles map to pipeline *jobs*; each keeps the previous defaults when its
+env var is unset (first installed model from the role's preference list
+wins; a set `--model` still overrides everything):
+
+| Role | Jobs | Env var (singular also accepted) | Default |
+|---|---|---|---|
+| translation | chunk MT, drift/compliance re-translation, bake-off candidates, MCP `translate_chunk` | `BOOK_HARNESS_TRANSLATION_MODELS` (`…_MODEL`) | `hy-mt2-30b-a3b, hy-mt2-7b, qwen2.5:14b, llama3.1:8b` |
+| assist | refinement (MQM estimate / A/B verify), rolling chapter summaries | `BOOK_HARNESS_ASSIST_MODELS` (`…_MODEL`) | falls back to the translation list |
+| qe | QE LLM-judge scoring, bake-off judge (`--judge` overrides) | `BOOK_HARNESS_QE_MODELS` (`…_MODEL`) | falls back to the assist list |
+
+```bash
+export BOOK_HARNESS_TRANSLATION_MODELS="hy-mt2-30b-a3b, qwen2.5:14b"
+export BOOK_HARNESS_QE_MODEL="Qwen/Qwen3.5-27B"       # single-element list
 ```

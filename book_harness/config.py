@@ -33,12 +33,59 @@ STAGE_DIRS = {
 TRANSLATION = "en"
 TARGET = "ar"
 
-#: Preference-ordered translation models. The first one found on the local
-#: server is used (see translate.build_client / *_Client.pick_model).
-TRANSLATION_MODELS = ["hy-mt2-30b-a3b", "hy-mt2-7b", "qwen2.5:14b", "llama3.1:8b"]
-#: General instruct model used for non-translation LLM calls (rolling summary).
-#: Kept swappable so a task-appropriate model can serve both roles in M1.
-ASSIST_MODELS = TRANSLATION_MODELS
+#: Role-based model assignment (session-level env override).
+#:
+#: Roles map to pipeline *jobs*, not prompts:
+#:
+#: ================ ====================================================
+#: Role             Used by
+#: ================ ====================================================
+#: ``translation``  MT work: chunks, drift-confirmed + compliance
+#:                  re-translation, bake-off candidates, MCP translate
+#: ``assist``       Refinement (MQM estimate / A/B verify) + rolling
+#:                  chapter summaries
+#: ``qe``           QE LLM-judge scoring + bake-off judge (``--judge``
+#:                  still overrides)
+#: ================ ====================================================
+#:
+#: Each role resolves its own preference list: the first entry installed on
+#: the server wins (via ``/v1/models`` or ``/api/tags``). Precedence:
+#: ``--model`` flag > role env var > role default (= the previous level's
+#: list), so the three levels collapse to today's defaults when no env is
+#: set: translation == assist defaults to the hard-coded list, QE defaults
+#: to assist.
+#:
+#: Variables (plural first, a singular alias is accepted as a one-element
+#: list):
+#:
+#: * ``BOOK_HARNESS_TRANSLATION_MODELS`` / ``BOOK_HARNESS_TRANSLATION_MODEL``
+#: * ``BOOK_HARNESS_ASSIST_MODELS`` / ``BOOK_HARNESS_ASSIST_MODEL``
+#: * ``BOOK_HARNESS_QE_MODELS`` / ``BOOK_HARNESS_QE_MODEL``
+#:
+#: Values: whitespace- or comma-separated Ollama names / server model IDs,
+#: e.g. ``BOOK_HARNESS_TRANSLATION_MODELS="hy-mt2-30b-a3b, qwen2.5:14b"``.
+
+_MODEL_DEFAULTS = ["hy-mt2-30b-a3b", "hy-mt2-7b", "qwen2.5:14b", "llama3.1:8b"]
+
+
+def _env_models(plural: str, singular: str, fallback: list[str]) -> list[str]:
+    """Preference list from env (comma/whitespace separated), else fallback."""
+    raw = os.environ.get(plural) or os.environ.get(singular) or ""
+    items = [x.strip() for x in raw.replace(",", " ").split() if x.strip()]
+    return items or fallback
+
+
+TRANSLATION_MODELS = _env_models(
+    "BOOK_HARNESS_TRANSLATION_MODELS",
+    "BOOK_HARNESS_TRANSLATION_MODEL",
+    _MODEL_DEFAULTS,
+)
+ASSIST_MODELS = _env_models(
+    "BOOK_HARNESS_ASSIST_MODELS",
+    "BOOK_HARNESS_ASSIST_MODEL",
+    TRANSLATION_MODELS,
+)
+QE_MODELS = _env_models("BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", ASSIST_MODELS)
 
 #: Default serving backend is Ollama (native ``/api/generate``). A host URL
 #: ending in ``/v1`` auto-selects the OpenAI-compatible chat-completions API
@@ -46,7 +93,7 @@ ASSIST_MODELS = TRANSLATION_MODELS
 #: ``BOOK_HARNESS_API`` / the CLI ``--api`` flag.
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_TIMEOUT = int(os.environ.get("BOOK_HARNESS_OLLAMA_TIMEOUT", "900"))
-API_DEFAULT = "auto"            # auto | ollama | openai
+API_DEFAULT = os.environ.get("BOOK_HARNESS_API", "auto")  # auto | ollama | openai
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 GENERATE_OPTIONS = {"temperature": 0.0, "num_ctx": 8192, "seed": 42}
