@@ -104,6 +104,51 @@ runs/<book-id>/
 - **Provenance manifest** — per chunk: model, prompt version, glossary version, timestamps
 - **TMX export** — aligned pairs as reusable translation memory
 
+## Known caveats & proposed solutions
+
+The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches in the original idea. Each is listed here with the solution baked into the design.
+
+### Glossary phase
+
+| # | Catch | Proposed solution |
+|---|---|---|
+| 1 | **GLiNER finds entities, not terms.** Zero-shot NER catches people/orgs/places, but book terminology is mostly multiword technical noun phrases ("reinforcement learning", "supply chain") that NER misses. | 3-signal extraction pipeline: GLiNER (with custom labels like `technical_term`) + noun-phrase/n-gram mining with TF-IDF rarity scoring + an LLM adjudication pass that merges, dedupes, and classifies candidates (term vs. name vs. noise). |
+| 2 | **Same word, different domains, different translations.** "Cell", "field", "interest" translate differently by domain; a flat lookup produces wrong terms. | **Phase 0 book profiling**: classify book/chapters into domains, then filter the arabterm lookup by a domain → dictionary whitelist (arabterm is already organized as separate dictionaries — military, finance, linguistics, legal, aerospace…). |
+| 3 | **A glossary pair is not a citation.** Without provenance, "certified" is unverifiable. | Every glossary entry is a cited artifact: source dictionary name, Wikidata ID, printed page, archive.org scan URL, plus `status` (`certified | llm_chosen | uncertified`) and `decided_by` (`auto | llm | human`). |
+| 4 | **LLM conflict resolution is nondeterministic.** When dictionaries disagree, letting the model "choose" each time yields inconsistent priorities. | Deterministic conflict policy encoded up front (e.g., KSAA unified glossaries > Librairie du Liban > others); LLM choice only on ties, with the reason recorded. |
+| 5 | **Uncertified terms degrade the glossary silently.** Scientific books always contain terms no dictionary covers. | Explicit uncertified-term policy: transliteration, keep-English-in-parentheses, or LLM coinage — all flagged `uncertified` for human review, never silently mixed in. |
+| 6 | **Arabic morphology breaks naive enforcement.** Prefixes/suffixes (ال، و، ب، ات، ين…) make literal string matching produce false violations and false compliance. | Shared Arabic normalizer (strip diacritics, unify alef/ya/ta-marbuta) + stem-aware matching (CAMeL Tools), used by both enforcement and the compliance audit. |
+| 7 | **The glossary drifts after translation starts.** Drafting reveals terms extraction missed. | Glossary freeze point (versioned artifact) before translation + one drift loop: mine the draft for new recurring terms → append as `uncertified` → human confirms → re-run only affected chunks. |
+
+### Translation phase
+
+| # | Catch | Proposed solution |
+|---|---|---|
+| 8 | **Fixed 1200-char chunks cut mid-sentence and mid-markdown.** | Chunk on structure: consecutive typed content blocks within one outline section, split at paragraph boundaries with a char ceiling, keyed by block id for exact reassembly. |
+| 9 | **Models destroy non-translatables** — equations, code, numbers, citations, URLs. | Structural passthrough by block type (Equation/Code/images/tables never reach the model) + inline placeholder protection only inside `Text` blocks. |
+| 10 | **Prior-paragraph context is too local.** The model doesn't know what the chapter is arguing. | Add a rolling chapter summary (one paragraph, updated every N chunks) alongside the prior paragraph. |
+| 11 | **Style inconsistency across 500 chunks.** Without a style guide the book reads like inconsistent essays. | Extract a style profile from 2–3 sample chapters in Phase 0 (tone, person, terminology conventions) and inject it into every prompt. |
+| 12 | **Hy-MT2 can translate but can't judge.** A dedicated MT model is not built for MQM span-locating or A/B verification. | Split roles: dedicated MT model (Hy-MT2 / TranslateGemma) translates; a general instruct model (Qwen3.5-27B / gemma-4-26B-A4B) does estimate and verify. |
+| 13 | **Refinement is always ×3 cost.** Running estimate/patch/verify on every chunk wastes compute on already-good chunks. | Reference-free QE scoring (cometkiwi) per chunk; spend the expensive passes on worst-scoring chunks first. |
+| 14 | **Per-chunk QA misses book-level drift.** The same term can map to different forms in different chapters. | Cross-chunk consistency audit: one source term → one target form everywhere; drift reported as a QA metric. |
+
+### OCR input
+
+| # | Catch | Proposed solution |
+|---|---|---|
+| 15 | **`block["page"]` is unreliable** (only 210 distinct values for 510 pages). | Always use the id-derived page (`/page/N/...`); `book.py` already does this. |
+| 16 | **Heading levels are occasionally inconsistent** (bare chapter-number headers, 4 empty `SectionHeader` blocks). | Outline repair: re-derive heading depth from section-numbering patterns (`N.` / `N.M.` / `N.M.K`) when OCR `h`-tags mis-nest. |
+| 17 | **OCR noise propagates into translation** — garbage-in/garbage-out. | Pre-translation QA gate using `page_stats` (extraction method, block counts) + block-level sanity checks to flag suspicious pages before spending model calls. |
+| 18 | **OCR table layouts rarely survive re-flowing** into Markdown pipe tables. | Keep table HTML as-is (round-trip safe); translate cell text only, never re-flow the markup. |
+
+### Operational
+
+| # | Catch | Proposed solution |
+|---|---|---|
+| 19 | **Hy-MT2-30B-A3B GGUF availability in Ollama is unverified.** | Verify early; fallbacks: Hy-MT2-7B GGUF, llama.cpp, or vLLM with FP8. |
+| 20 | **QE model license (CC-BY-NC) blocks commercial use.** | Keep QE swappable; LLM-judge fallback. |
+| 21 | **Interruption mid-run loses work.** | Everything-on-disk + `state.json` stage cursor; cache key per chunk = `hash(source_chunk + glossary_version + model + prompt_version)` so only affected chunks re-run. |
+
 ## Roadmap
 
 - **M1 — MVP:** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
