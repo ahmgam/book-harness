@@ -168,4 +168,22 @@ See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
 ## Status
 
-🚧 Design phase — implementation starting at M1.
+**M1 (MVP) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → resumable `book.md` assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11); task 1.12 (full-book validation) is run with:
+
+```bash
+book-harness run <main-ocr-json>            # full book (local model required)
+book-harness run <main-ocr-json> --pages 30 45 --model llama3.1:8b   # smoke
+```
+
+Run artifacts land in `runs/<book-id>/` (see below). Every stage is resumable; drafts are keyed by `hash(source_chunk + glossary_version + model + prompt_version)`.
+
+> Verified checklist (PLAN §3): arabterm db loads with domain → dictionary whitelists (aerospace-engineering, information-tech, …); Hy-MT2-30B-A3B GGUF is available for Ollama (`ollama pull melashri/hy-mt2-30b-a3b`); GLiNER works when the `gliner` extra + HF access are available and the pipeline falls back to n-gram mining otherwise.
+
+## Usage
+
+```bash
+python -m venv .venv && .venv/bin/pip install -e ".[tests]"
+.venv/bin/book-harness run path/to/ocr_main.json [options]
+```
+
+Key options: `--model` (force a translation model), `--domains aerospace`, `--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after chunking).

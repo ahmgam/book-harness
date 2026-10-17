@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book-harness"
+version = "0.1.0"
+description = "End-to-end pipeline for translating technical books (OCR JSON -> glossary -> translation -> markdown) with a cited glossary and resumable stages."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "book-harness contributors" }]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+# Optional extraction signal; heavy (pulls torch) and requires HF model access.
+# The n-gram miner in book_harness.terms works without it.
+gliner = ["gliner>=0.2"]
+tests = ["pytest>=8.0"]
+
+[project.scripts]
+book-harness = "book_harness.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["book_harness*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
