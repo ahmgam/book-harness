@@ -1,7 +1,7 @@
 # Book-Harness — Brainstorming Notes
 
 > Analysis of the translation workflow idea from two perspectives: (1) the idea itself — accuracy, cited terms, glossary; (2) implementation — best approach and main directions.
-> Companion to [main-idea.md](./main-idea.md).
+> Companions: [main-idea.md](./main-idea.md), [ocr-output-analysis.md](./ocr-output-analysis.md) — the pipeline is end-to-end from PDF, entering at the marker/datalab OCR output.
 
 ---
 
@@ -46,8 +46,8 @@
 
 ## Gaps worth closing in Phase 2 (translation)
 
-- **Chunk on structure, not character count.** 1200 chars will cut mid-sentence and mid-markdown. Chunk at paragraph boundaries with a char ceiling, keep sentence-level fallback, and store `(chapter, index, source_offset)` so reassembly and diffs are exact.
-- **Protect non-translatable spans.** Numbers, citations, footnotes, URLs, code, math, cross-references → replace with placeholder tokens before the model sees the text, restore after. This is the single biggest quality lever for technical books.
+- **Chunk on structure, not character count.** 1200 chars will cut mid-sentence and mid-markdown. With the OCR input (see Input contract below), chunking is *section-aligned*: consecutive typed content blocks within one outline section, split at paragraph boundaries with a char ceiling, keyed by block id so reassembly and diffs are exact.
+- **Protect non-translatable spans — structurally, not heuristically.** The OCR already types the hard cases: `Equation` blocks carry LaTeX, `Code` blocks are listings, images live in typed groups — all passthrough by block type. Only *inline* spans inside `Text` blocks (numbers, citations, URLs, cross-references) still need placeholder tokens. This is the single biggest quality lever for technical books, and the typed input makes most of it free.
 - **Context strategy:** prior paragraph is good; add a *rolling chapter summary* (one paragraph, updated every N chunks) so the model knows what the chapter is arguing, not just what the last paragraph said.
 - **Style profile.** Extract a style guide from 2–3 sample chapters (tone, person, terminology conventions) in Phase 0 and inject it — otherwise the book reads like 500 inconsistent essays.
 - **Hy-MT2 can translate but can't judge.** `tencent/Hy-MT2-30B-A3B` is a dedicated MT model — it follows translation instructions (including an official **terminology template**: "`X` translates to `Y`" lines) but it is not built for MQM span-locating or A/B judging. Use a general instruct model (Qwen3.5-27B / gemma-4-26B-A4B) for stages 2a and 2c, and Hy-MT2 (or TranslateGemma) for stage 1 and 2b's candidate generation.
@@ -81,7 +81,8 @@ The key insight: **the pipeline core should be a library with pure file I/O**, a
 
 ```mermaid
 flowchart TD
-    A[PDF / EPUB / MD] --> B[Ingest: layout + OCR fallback → structured Markdown]
+    A[PDF] --> O[OCR: marker/datalab<br/>main JSON + _meta.json]
+    O --> B[Consolidate: book.py Book model<br/>typed blocks + outline + images]
     B --> P[Phase 0: profile - domain, style, entities]
     P --> C[Term extraction: GLiNER + n-gram mining]
     C --> D[arabterm lookup: SQLite, domain-filtered]
@@ -89,13 +90,46 @@ flowchart TD
     E -- yes --> F[glossary.yaml + citations]
     E -- no --> G[LLM adjudication / uncertified flag]
     G --> F
-    F --> H[Chunker: paragraph-aligned, placeholders]
+    F --> H[Chunker: section-aligned typed blocks<br/>inline placeholders in Text only]
     H --> I[Ollama: Hy-MT2-30B-A3B / TranslateGemma<br/>glossary + rolling context injected]
     I --> J[QE scoring: cometkiwi]
     J --> K[Refinement: estimate → literal patch → A/B verify]
     K --> L[Compliance check: normalized Arabic glossary audit]
     L --> M[Assembly: markdown/HTML + glossary appendix + QA report + manifest]
 ```
+
+## Input contract — end-to-end from PDF via the existing OCR stage
+
+The OCR stage already exists (marker/datalab) and its output is analyzed in [ocr-output-analysis.md](./ocr-output-analysis.md). The harness therefore does **not** ingest raw PDFs; its canonical input is the OCR pair:
+
+- **main JSON** — `page_info` (authoritative page grid), `blocks` (typed content blocks with `html`, `section_hierarchy`, inline base64 `images`)
+- **`_meta.json`** — flat TOC (title → `page_id`), per-page `page_stats`, debug path
+
+`book.py` consolidates both into one `Book` model (canonical id-derived pages, chrome excluded, global image index, nested outline tree). The pipeline operates on that model, which changes the workflow in three important ways:
+
+**1. Block types replace placeholder heuristics.** Translatability is decided structurally, per block type:
+
+| Block type | Workflow treatment |
+|---|---|
+| `Text` | Translate (inline `<math>`/links still protected inside the block) |
+| `SectionHeader` | Translate title text; preserve section numbering (`1.4`, `2.3.1`) |
+| `ListGroup` | Translate `<li>` items, keep list structure |
+| `Caption`, `Footnote` | Translate |
+| `Equation` | **Passthrough** — LaTeX source, never sent to the model |
+| `Code` | **Passthrough** — fenced listings |
+| `Picture` / `Figure` / `FigureGroup` / `PictureGroup` | Passthrough; images extracted to disk; only captions translated |
+| `Table` / `TableGroup` | Structure passthrough; translate cell text only |
+| `TableOfContents` | Skip or translate titles only |
+| `PageHeader` / `PageFooter` | **Drop** (rendering chrome) |
+
+**2. Chunking becomes section-aligned.** `section_hierarchy` on every block (all 12,120 references resolve) plus the outline tree means translation units can be scoped to chapters/sections: chunk = consecutive content blocks within one outline section, split at paragraph boundaries with a char ceiling, keyed by block id. This gives better context, per-chapter glossary scoping, and exact reassembly via block ids.
+
+**3. Page provenance is free.** Canonical pages come from block ids (`/page/N/...`); the `page` field is unreliable and stays ignored (book.py already handles this). Page numbers feed the glossary citations ("term first used on p. N") and the QA report.
+
+**Inherited OCR caveats the harness must handle:**
+- Heading levels are occasionally inconsistent (bare chapter-number headers, 4 empty `SectionHeader` blocks) — the outline may need re-derivation from section-numbering patterns (`N.` / `N.M.` / `N.M.K`).
+- OCR noise propagates into translation: add a cheap pre-translation QA pass using `page_stats` (extraction method, block counts) and block-level sanity checks to flag suspicious pages before spending model calls.
+- Tables stay as HTML (round-trip safe); cell-level translation must not re-flow the table markup.
 
 ## Component choices (verified names)
 
@@ -106,6 +140,7 @@ flowchart TD
 | Refinement/verify | **Qwen/Qwen3.5-27B** or **google/gemma-4-26B-A4B-it** | General instruct model needed for MQM spans + A/B judging |
 | NER/term spans | **urchade/gliner_multi-v2.1** (or gliner2 ecosystem) | Zero-shot, CPU-friendly, custom labels |
 | Quality estimation | **Unbabel/wmt22-cometkiwi-da** | Reference-free QE; note CC-BY-NC license |
+| OCR / ingest | **marker (datalab) + `book.py`** | Already built: main JSON + `_meta.json` → `Book` model (typed blocks, outline, images); the harness consumes this, not raw PDFs |
 | Terminology DB | **arabterm.db** (SQLite) | `dictionary` + `term` tables; AR/EN/FR; Wikidata + archive.org provenance built in — query directly, no MCP strictly required |
 | OCR fallback (scanned Arabic) | MohamedRashad/arabic-large-nougat, PaddleOCR arabic | Only if sources are scans |
 
@@ -113,7 +148,7 @@ flowchart TD
 
 ```text
 runs/<book-id>/
-  00_source/          original file + extracted markdown
+  00_source/          OCR JSON pair (main + _meta), consolidated Book model, extracted images
   01_profile/         domain.json, style.md, entities.jsonl
   02_glossary/        candidates.jsonl, glossary.yaml (versioned), audit.md
   03_chunks/          chunk-0001.json (source, placeholders, hash)
@@ -128,7 +163,7 @@ Cache key per chunk = `hash(source_chunk + glossary_version + model + prompt_ver
 
 ## Engineering details that decide success or failure
 
-1. **Placeholder protection** for markdown structure, links, math, numbers, citations — translate *around* them, never through them.
+1. **Structural passthrough by block type** (Equation/Code/images/tables) + inline placeholder protection only inside `Text` blocks — translate *around* non-translatables, never through them.
 2. **Arabic text normalization module** used by both enforcement and compliance (diacritics, alef forms, ta marbuta) — shared by extraction and QA.
 3. **Determinism**: fixed seeds/temperature where possible; cache keyed on content, not position.
 4. **Model bake-off first**: before committing, translate the same 30–50 sampled chunks with Hy-MT2-7B, Hy-MT2-30B-A3B, TranslateGemma-12b, Qwen3.5-27B; score with COMET + a glossary-compliance metric. Pick empirically, not by reputation.
@@ -136,7 +171,7 @@ Cache key per chunk = `hash(source_chunk + glossary_version + model + prompt_ver
 
 ## Phased roadmap
 
-- **M1 — MVP (idea validation):** markdown in → GLiNER + arabterm glossary with citations → Ollama translation with glossary injection → markdown out. No refinement yet.
+- **M1 — MVP (idea validation):** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks with glossary injection → markdown out. No refinement yet.
 - **M2 — Accuracy:** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + deterministic compliance audit.
 - **M3 — Artifacts:** glossary appendix, bilingual HTML, QA report, provenance manifest, resume-from-any-stage.
 - **M3.5 — MCP server** wrapping glossary lookup + chunk translation (the arabterm-MCP idea, generalized).
@@ -147,6 +182,7 @@ Cache key per chunk = `hash(source_chunk + glossary_version + model + prompt_ver
 - **30B-A3B availability in Ollama** — verify GGUF support early; fallback is llama.cpp/vLLM or the 7B model.
 - **Enforcement false positives** from Arabic morphology — budget real time for the normalizer.
 - **QE model license** (NC) if this ever goes commercial — have an LLM-judge fallback.
+- **OCR noise propagates into translation** — garbage-in/garbage-out: add the pre-translation QA pass (page_stats + block sanity) and treat OCR quality as a gate, not an assumption.
 - **Scope creep in the UI** — keep M4 last; the files-first core is what makes everything else possible.
 
 ---
