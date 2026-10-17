@@ -23,7 +23,10 @@ from book_harness.state import RunState
 
 logger = logging.getLogger("book-harness")
 
-STAGES = ["source", "terms", "glossary", "chunk", "translate", "assemble"]
+STAGES = [
+    "source", "terms", "glossary", "chunk", "gate", "translate",
+    "qe", "refine", "compliance", "consistency", "assemble",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +132,270 @@ def _glossary_version(settings: Settings) -> str:
     return _load_glossary(settings)[0]
 
 
+def _drafts_meta(settings: Settings) -> dict[str, dict]:
+    from book_harness.assemble import DraftBook
+
+    drafts = DraftBook(settings.stage_dir(stage="drafts"))
+    return drafts.meta_by_chunk
+
+
+def _assist_client(settings: Settings):
+    from book_harness.translate import OllamaClient
+
+    client = OllamaClient(
+        host=settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        preferred=config.ASSIST_MODELS,
+    )
+    client.pick_model(settings.model)          # explicit model also steers QA roles
+    return client
+
+
+# ---------------------------------------------------------------------------
+# M2 stages
+# ---------------------------------------------------------------------------
+
+def stage_gate(settings: Settings, book: Book) -> dict:
+    """OCR QA gate: flag suspicious pages before model spend (task 2.6)."""
+    from book_harness.qa import gate_pages, write_gate
+
+    records = gate_pages(book)
+    write_gate(records, settings.stage_dir(stage="qa"))
+    flagged = [r for r in records if r["suspect"]]
+    summary = {
+        "pages": len(records),
+        "flagged": len(flagged),
+        "suspicious_pages": [r["page"] for r in flagged][:50],
+    }
+    if flagged:
+        logger.warning(
+            "OCR QA gate: %d/%d pages flagged (junk/fragmented/empty headers); "
+            "see 06_qa/gate.jsonl", len(flagged), len(records),
+        )
+    else:
+        logger.info("OCR QA gate: clean (%d pages)", len(records))
+    return summary
+
+
+def stage_qe(settings: Settings, chunks: list) -> dict[str, dict]:
+    """Reference-free QE scoring per chunk (task 2.1) -> qe-scores.jsonl."""
+    from book_harness.qa import (
+        CometScorer,
+        draft_pairs,
+        latest_by_chunk,
+        qe_cache_key,
+        qe_score_chunk,
+        read_records,
+        write_records,
+    )
+
+    drafts_meta = _drafts_meta(settings)
+    comet = None
+    if settings.qe_method in ("auto", "comet"):
+        comet = CometScorer()
+        if not comet.available:
+            logger.info("cometkiwi not installed; using the LLM judge for QE")
+    elif settings.qe_method == "comet":
+        comet = CometScorer()
+        if not comet.available:
+            raise RuntimeError("qe-method=comet but the comet stack is unavailable")
+    client = None if comet and comet.available and settings.qe_method == "comet" \
+        else _assist_client(settings)
+    effective_method = (
+        settings.qe_method if settings.qe_method != "auto"
+        else ("comet" if comet and comet.available else "judge")
+    )
+    effective_model = (
+        comet.model_name if effective_method == "comet" else getattr(client, "model", "")
+    )
+    qa_dir = settings.stage_dir(stage="qa")
+    path = qa_dir / "qe-scores.jsonl"
+    scores: dict[str, dict] = latest_by_chunk(read_records(path))
+    scored = 0
+    for c in chunks:
+        cd = c.to_dict()
+        draft = drafts_meta.get(c.chunk_id)
+        if not draft:
+            continue
+        # resume: skip when draft+scorer identity is unchanged
+        key = qe_cache_key(
+            draft_pairs(cd, draft),
+            qe_prompt_version=config.QE_PROMPT_VERSION,
+            model=str(effective_model or ""),
+            method=effective_method,
+            chunk_id=c.chunk_id,
+        )
+        existing = scores.get(c.chunk_id)
+        if existing and existing.get("cache_key") == key and existing.get("finished"):
+            continue
+        record = qe_score_chunk(
+            cd, draft, client,
+            qe_prompt_version=config.QE_PROMPT_VERSION,
+            comet=comet, method=settings.qe_method,
+        )
+        scores[c.chunk_id] = record
+        scored += 1
+        logger.info(
+            "qe %s: score=%s (%s, %d units)",
+            c.chunk_id, record["score"], record["method"], len(record["unit_scores"]),
+        )
+    write_records(scores.values(), path)
+    return scores
+
+
+def stage_refine(settings: Settings, chunks: list) -> int:
+    """QE-budgeted refinement (tasks 2.2 + 2.3)."""
+    from book_harness.refine import plan_refinement, refine_chunk
+
+    drafts_meta = _drafts_meta(settings)
+    scores = {}
+    scores_path = settings.run_dir() / config.STAGE_DIRS["qa"] / "qe-scores.jsonl"
+    if scores_path.exists():
+        from book_harness.qa import latest_by_chunk, read_records
+
+        scores = latest_by_chunk(read_records(scores_path))
+    plan = plan_refinement(
+        [c.to_dict() for c in chunks], drafts_meta, scores,
+        quality_threshold=settings.quality_threshold,
+        budget=settings.refine_budget,
+    )
+    skipped = len(drafts_meta) - len(plan)
+    logger.info(
+        "refine: %d chunk(s) planned (worst first; %d above %.0f threshold or undrafted)",
+        len(plan), max(0, skipped), settings.quality_threshold,
+    )
+    client = _assist_client(settings)
+    refine_dir = settings.run_dir() / config.STAGE_DIRS["refine"]
+    done = 0
+    for chunk_dict, score in plan:
+        refined = refine_chunk(
+            chunk_dict, drafts_meta[chunk_dict["chunk_id"]], client, refine_dir,
+            draft_cache_key=drafts_meta[chunk_dict["chunk_id"]].get("cache_key", ""),
+            prompt_version=config.REFINE_PROMPT_VERSION,
+            max_spans=settings.max_spans,
+        )
+        done += 1
+        counters = refined["counters"]
+        logger.info(
+            "refined %s (qe=%.0f): %d spans, %d patches accepted, %d rejected (%d/%d)",
+            chunk_dict["chunk_id"], score, counters["spans"],
+            counters["accepted"], counters["rejected"], done, len(plan),
+        )
+    return done
+
+
+def _compliance_records(settings: Settings, chunks: list, entries: list[dict]) -> list[dict]:
+    from book_harness.qa import compliance_audit
+
+    records = []
+    drafts_meta = _drafts_meta(settings)
+    glossary_version = _glossary_version(settings)
+    for c in chunks:
+        rec = compliance_audit(
+            c.to_dict(), drafts_meta.get(c.chunk_id), entries,
+            glossary_version=glossary_version,
+        )
+        records.append(rec)
+    return records
+
+
+def stage_compliance(settings: Settings, chunks: list, entries: list[dict]) -> list[dict]:
+    """Glossary enforcement audit -> compliance.jsonl, with re-queue pass."""
+    from book_harness.qa import requeue_targets, write_records
+    from book_harness.translate import SummaryTracker, translate_chunk
+
+    qa_dir = settings.stage_dir(stage="qa")
+    path = qa_dir / "compliance.jsonl"
+    records = _compliance_records(settings, chunks, entries)
+    write_records(records, path)
+
+    if not settings.requeue:
+        _log_compliance(records)
+        return records
+
+    requeue = requeue_targets(records, settings.compliance_floor)
+    if not requeue:
+        _log_compliance(records)
+        return records
+
+    # Targeted re-translation (2.4): violated terms become a hard emphasis and
+    # enter the cache key, so only violating chunks are regenerated.
+    drafts_dir = settings.stage_dir(stage="drafts")
+    client = _assist_client(settings)
+    summaries = SummaryTracker(
+        client,
+        drafts_dir / "chapter-summary.json",
+        period=settings.summary_period,
+    )
+    glossary_version = _glossary_version(settings)
+    violated_terms = {
+        r["chunk_id"]: [
+            (v["term_en"], v["term_ar"]) for v in r["violations"]
+        ]
+        for r in requeue
+    }
+    for c in chunks:
+        if c.chunk_id not in violated_terms:
+            continue
+        logger.info(
+            "re-queuing %s for targeted re-translation (%d violations)",
+            c.chunk_id, len(violated_terms[c.chunk_id]),
+        )
+        translate_chunk(
+            c.to_dict(), client, entries, drafts_dir,
+            prompt_version=settings.prompt_version,
+            glossary_version=glossary_version,
+            summaries=summaries,
+            emphasis=violated_terms[c.chunk_id],
+        )
+    after = _compliance_records(settings, [
+        c for c in chunks if c.chunk_id in violated_terms
+    ], entries)
+    requeue_ids = {r["chunk_id"] for r in requeue}
+    records = [t for t in records if t["chunk_id"] not in requeue_ids] + after
+    write_records(records, path)
+    _log_compliance(records)
+    return records
+
+
+def _log_compliance(records: list[dict]) -> None:
+    rated = [r for r in records if r.get("rate") is not None]
+    if not rated:
+        logger.info("compliance: no enforced terms matched any chunk source")
+        return
+    below = [r for r in rated if r["rate"] < 95.0]
+    logger.info(
+        "compliance: %d rated chunks, mean rate %.1f%%, below-floor: %d",
+        len(rated),
+        sum(r["rate"] for r in rated) / len(rated),
+        len(below),
+    )
+
+
+def stage_consistency(settings: Settings, chunks: list, entries: list[dict]) -> dict:
+    """Book-level terminology drift audit (task 2.5) -> consistency.jsonl."""
+    from book_harness.qa import consistency_audit, write_records
+
+    drafts_meta = _drafts_meta(settings)
+    chunk_drafts = [
+        (c.to_dict(), drafts_meta.get(c.chunk_id)) for c in chunks
+    ]
+    records, summary = consistency_audit(chunk_drafts, entries)
+    write_records(records, settings.stage_dir(stage="qa") / "consistency.jsonl")
+    logger.info(
+        "consistency: %d/%d enforced terms drift from the certified rendering",
+        summary["drift_terms"], summary["terms_checked"],
+    )
+    for r in records:
+        if r["drift"]:
+            alts = {form: ids for form, ids in r["alternative_hits"].items() if ids}
+            logger.info(
+                "drift: '%s' (expected %s) alternatives used: %s",
+                r["term_en"], r["expected"], alts,
+            )
+    return summary
+
+
 def stage_assemble(settings: Settings, book: Book) -> Path:
     from book_harness.assemble import DraftBook, render_book
     from book_harness.chunker import load_chunks
@@ -136,7 +403,11 @@ def stage_assemble(settings: Settings, book: Book) -> Path:
     chunks = load_chunks(settings.run_dir() / config.STAGE_DIRS["chunks"])
     drafts = DraftBook(settings.stage_dir(stage="drafts"))
     out_dir = settings.stage_dir(stage="output")
-    render_book(book, chunks, drafts, out_dir, book_id=settings.book_id)
+    render_book(
+        book, chunks, drafts, out_dir,
+        book_id=settings.book_id,
+        refine_dir=settings.run_dir() / config.STAGE_DIRS["refine"],
+    )
     logger.info("assembled -> %s/book.md", out_dir)
     return out_dir / "book.md"
 
@@ -175,6 +446,10 @@ def run(settings: Settings) -> int:
     chunks = stage_chunk(settings, book)
     state.mark("chunk", status="done", chunks=len(chunks))
 
+    state.mark("gate", status="started")
+    gate_summary = stage_gate(settings, book)
+    state.mark("gate", status="done", flagged=gate_summary["flagged"])
+
     if not settings.translate:
         logger.info("translation skipped (--no-translate)")
         state.save()
@@ -183,6 +458,31 @@ def run(settings: Settings) -> int:
     state.mark("translate", status="started")
     n_translated = stage_translate(settings, chunks)
     state.mark("translate", status="done", chunks=n_translated)
+
+    _, entries, _ = _load_glossary(settings)
+
+    state.mark("qe", status="started")
+    if settings.qe_method != "none":
+        scores = stage_qe(settings, chunks)
+        state.mark("qe", status="done", chunks=len(scores))
+    else:
+        scores = {}
+        state.mark("qe", status="done", skipped=True)
+
+    state.mark("refine", status="started")
+    if settings.refine:
+        n_refined = stage_refine(settings, chunks)
+        state.mark("refine", status="done", chunks=n_refined)
+    else:
+        state.mark("refine", status="done", skipped=True)
+
+    state.mark("compliance", status="started")
+    stage_compliance(settings, chunks, entries)
+    state.mark("compliance", status="done")
+
+    state.mark("consistency", status="started")
+    stage_consistency(settings, chunks, entries)
+    state.mark("consistency", status="done")
 
     state.mark("assemble", status="started")
     stage_assemble(settings, book)
@@ -219,9 +519,47 @@ def build_parser() -> argparse.ArgumentParser:
                        help="smoke run: restrict translation to pages LO..HI")
     run_p.add_argument("--no-translate", action="store_true",
                        help="stop after chunking")
+    run_p.add_argument("--qe-method", choices=["auto", "judge", "comet", "none"],
+                       default=config.QE_METHOD_DEFAULT,
+                       help="QE scorer: cometkiwi if installed, else LLM judge")
+    run_p.add_argument("--no-refine", action="store_true",
+                       help="skip the estimate/patch/verify refinement loop")
+    run_p.add_argument("--no-requeue", action="store_true",
+                       help="do not re-translate compliance-violating chunks")
+    run_p.add_argument("--quality-threshold", type=float,
+                       default=config.QUALITY_THRESHOLD,
+                       help="skip refinement for chunks scoring >= this (0-100)")
+    run_p.add_argument("--compliance-floor", type=float,
+                       default=config.COMPLIANCE_FLOOR,
+                       help="re-translate chunks below this compliance %%")
+    run_p.add_argument("--refine-budget", type=int, default=config.REFINE_BUDGET,
+                       help="max chunks refined per pass (None = all below threshold)")
+    run_p.add_argument("--max-spans", type=int, default=config.REFINE_MAX_SPANS,
+                       help="max MQM error spans per unit (default 12)")
     run_p.add_argument("--log-level", default="INFO")
 
     sub.add_parser("stages", help="show pipeline stages")
+
+    bake_p = sub.add_parser(
+        "bakeoff",
+        help="M2: sample-chunk model comparison (run --no-translate first)",
+    )
+    bake_p.add_argument("ocr_json", type=Path, help="main OCR JSON file")
+    bake_p.add_argument("--models", nargs="+",
+                        default=["hy-mt2-30b-a3b", "hy-mt2-7b", "translategemma-12b",
+                                 "qwen3.5-27b"],
+                        help="candidate translation models (Ollama names)")
+    bake_p.add_argument("--chunks", type=int, default=30,
+                        help="sample size (evenly spread across the book)")
+    bake_p.add_argument("--judge", default=None,
+                        help="force a QE judge model (default: assist preference)")
+    bake_p.add_argument("--run-root", type=Path, default=Path("runs"))
+    bake_p.add_argument("--ollama-host", default=config.OLLAMA_HOST)
+    bake_p.add_argument("--ollama-timeout", type=int, default=config.OLLAMA_TIMEOUT)
+    bake_p.add_argument("--max-chunks", type=int, default=None)
+    bake_p.add_argument("--pages", nargs=2, type=int, metavar=("LO", "HI"))
+    bake_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
+    bake_p.add_argument("--log-level", default="INFO")
     return p
 
 
@@ -244,18 +582,35 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings(
         run_root=args.run_root,
         ocr_file=ocr_file,
-        model=args.model,
+        model=getattr(args, "model", None),
         ollama_host=args.ollama_host,
+        ollama_timeout=getattr(args, "ollama_timeout", config.OLLAMA_TIMEOUT),
         domains=tuple(args.domains),
-        char_ceiling=args.char_ceiling,
-        char_floor=args.char_floor,
-        glossary_limit=args.glossary_limit,
-        max_chunks=args.max_chunks,
-        pages=tuple(args.pages) if args.pages else None,
-        translate=not args.no_translate,
+        char_ceiling=getattr(args, "char_ceiling", config.CHAR_CEILING),
+        char_floor=getattr(args, "char_floor", config.MIN_CHUNK_CHARS),
+        glossary_limit=getattr(args, "glossary_limit", None),
+        max_chunks=getattr(args, "max_chunks", None),
+        pages=tuple(args.pages) if getattr(args, "pages", None) else None,
+        translate=not getattr(args, "no_translate", False),
         log_level=args.log_level,
+        qe_method=getattr(args, "qe_method", "auto"),
+        refine=getattr(args, "refine", True),
+        requeue=getattr(args, "requeue", True),
+        quality_threshold=getattr(args, "quality_threshold", config.QUALITY_THRESHOLD),
+        compliance_floor=getattr(args, "compliance_floor", config.COMPLIANCE_FLOOR),
+        refine_budget=getattr(args, "refine_budget", config.REFINE_BUDGET),
+        max_spans=getattr(args, "max_spans", config.REFINE_MAX_SPANS),
     )
     try:
+        if args.command == "bakeoff":
+            from book_harness.bakeoff import run_bakeoff
+
+            report = run_bakeoff(
+                settings, models=args.models, n_chunks=args.chunks,
+                judge_model=args.judge,
+            )
+            logger.info("bake-off report: %s", report)
+            return 0
         return run(settings)
     except ConnectionError as e:
         logger.error("ollama connection failed: %s", e)

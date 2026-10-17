@@ -15,6 +15,9 @@ dependencies = ["PyYAML>=6.0"]
 # Optional extraction signal; heavy (pulls torch) and requires HF model access.
 # The n-gram miner in book_harness.terms works without it.
 gliner = ["gliner>=0.2"]
+# Optional QE backend (cometkiwi); the LLM judge is the default otherwise.
+# cometkiwi weights are CC-BY-NC: personal use only.
+qe = ["unbabel-comet"]
 tests = ["pytest>=8.0"]
 
 [project.scripts]

@@ -1,11 +1,13 @@
 """Book-Harness: OCR JSON -> cited glossary -> translation -> markdown.
 
-Pipeline stages (see PLAN.md, milestone M1):
+Pipeline stages (see PLAN.md, milestones M1/M2):
 
     00_source     OCR JSON pair -> consolidated Book model + extracted images
     02_glossary   term extraction -> arabterm lookup -> glossary.yaml
     03_chunks     section-aligned chunks with inline placeholders
     04_drafts     Ollama translation with glossary + rolling context
+    06_qa         QE scores, compliance + consistency audits, OCR gate
+    05_refine     estimate -> literal patch -> A/B verify refinement
     07_output     reassembled book.md + manifest
 
 Everything lands on disk; every stage can be re-run or resumed.

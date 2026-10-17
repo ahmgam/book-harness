@@ -81,6 +81,45 @@ STOPWORDS = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Quality estimation + refinement (M2: tasks 2.1 / 2.3 / 2.4)
+# ---------------------------------------------------------------------------
+
+#: Prompt versions for the M2 roles (bump to invalidate QE/refine artifacts).
+QE_PROMPT_VERSION = "qe-m2-v1"
+REFINE_PROMPT_VERSION = "refine-m2-v1"
+
+#: Chunks scoring at/above this QE score are skipped by refinement (2.3).
+#: Score scale is 0-100 regardless of scoring method.
+QUALITY_THRESHOLD = 80.0
+
+#: Default QE scorer selection: "auto" prefers cometkiwi when the optional
+#: stack is installed, falling back to the LLM judge.
+QE_METHOD_DEFAULT = "auto"
+
+#: Chunks below this compliance rate (%) are re-queued for targeted
+#: re-translation (2.4).
+COMPLIANCE_FLOOR = 95.0
+
+#: Hard cap on the number of chunks refined in one pass (None = budgetless;
+#: worst-scoring chunks go first either way).
+REFINE_BUDGET: int | None = None
+
+#: Maximum error spans the estimator may report per unit (blockquote budget).
+REFINE_MAX_SPANS = 12
+
+#: MQM categories the estimator is asked to use (regex-agnostic, display only).
+MQM_CATEGORIES = (
+    "terminology",
+    "accuracy",
+    "fluency",
+    "terminology/consistency",
+    "numbers",
+    "style",
+    "punctuation",
+)
+
+
+# ---------------------------------------------------------------------------
 # Chunking policy (task 1.7)
 # ---------------------------------------------------------------------------
 
@@ -175,6 +214,14 @@ class Settings:
     translate: bool = True
     log_level: str = "INFO"
     skip_stages: list[str] = field(default_factory=list)
+    # --- M2 (refinement + QA) ---
+    qe_method: str = "auto"                     # auto | judge | comet | none
+    refine: bool = True
+    requeue: bool = True                        # re-translate compliance violators
+    quality_threshold: float = QUALITY_THRESHOLD
+    compliance_floor: float = COMPLIANCE_FLOOR
+    refine_budget: int | None = REFINE_BUDGET
+    max_spans: int = REFINE_MAX_SPANS
 
     @property
     def book_id(self) -> str:

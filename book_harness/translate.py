@@ -251,14 +251,22 @@ def translate_chunk(
     glossary_version: str,
     summaries: SummaryTracker,
     max_units: int | None = None,
+    emphasis: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Translate one chunk; skip when a fresh draft already exists."""
+    """Translate one chunk; skip when a fresh draft already exists.
+
+    ``emphasis`` is the M2 compliance re-queue hook: term pairs that the
+    compliance audit flagged. Adding them to the cache-key source naturally
+    invalidates the stale draft and forces a keyed re-translation.
+    """
     drafts_dir.mkdir(parents=True, exist_ok=True)
     chunk_id = chunk["chunk_id"]
     source = json.dumps(
         {"section": chunk["section_title"], "units": [u["text"] for u in chunk["units"]]},
         ensure_ascii=False,
     )
+    if emphasis:
+        source += "\x1eemphasis:" + json.dumps(emphasis, ensure_ascii=False)
     key = cache_key(source, glossary_version, client.model or "", prompt_version)
 
     meta_path = drafts_dir / f"{chunk_id}.meta.json"
@@ -291,7 +299,8 @@ def translate_chunk(
             context_parts.append("Previous paragraph translation:\n" + prior_translation)
         context = "\n\n".join(context_parts)
         text_out = translate_unit(
-            client, unit["text"], g_lines, context, unit.get("kind", "text")
+            client, unit["text"], g_lines, context, unit.get("kind", "text"),
+            emphasis=emphasis,
         )
         restored = restore_placeholders(unit, text_out)
         results.append({
@@ -332,6 +341,7 @@ def translate_unit(
     glossary_lines_: list[str],
     context: str,
     kind: str,
+    emphasis: list[tuple[str, str]] | None = None,
 ) -> str:
     kind_instr = {
         "title": "a section heading",
@@ -341,6 +351,21 @@ def translate_unit(
     user = []
     if glossary_lines_:
         user.append("Terminology glossary:\n" + "\n".join(glossary_lines_) + "\n")
+    if emphasis:
+        from book_harness.qa import source_matches
+
+        relevant = [
+            (en, ar) for en, ar in emphasis
+            if source_matches(en, text) and ar
+        ]
+        if relevant:
+            user.append(
+                "MANDATORY terminology (previous translations violated these; "
+                "every listed Arabic term MUST appear exactly as written):\n"
+                + "\n".join(
+                    GLOSSARY_TEMPLATE.format(en=en, ar=ar) for en, ar in relevant
+                ) + "\n"
+            )
     if context:
         user.append(context + "\n")
     user.append(f"Translate into Arabic ({kind_instr}):\n{text}")

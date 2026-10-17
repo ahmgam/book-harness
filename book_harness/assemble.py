@@ -56,6 +56,32 @@ class DraftBook:
 
 
 # ---------------------------------------------------------------------------
+# Refinement merge (M2)
+# ---------------------------------------------------------------------------
+
+def _apply_refinements(drafts: DraftBook, refine_dir: Path) -> int:
+    """Overlay verified refined unit texts onto the drafts, siloed by chunk."""
+    from book_harness.refine import load_refinements
+
+    refinements = load_refinements(refine_dir, drafts.meta_by_chunk)
+    applied = 0
+    for chunk_id, overrides in refinements.items():
+        for uid, text in overrides.items():
+            unit = drafts.unit_texts.get(f"{chunk_id}/{uid}")
+            if unit is None:
+                continue
+            unit = dict(unit)
+            unit["text"] = text
+            unit["refined"] = True
+            drafts.unit_texts[f"{chunk_id}/{uid}"] = unit
+            applied += 1
+    if applied:
+        logger.info("refined units applied: %d (of %s chunks)", applied,
+                    ", ".join(refinements) or 0)
+    return applied
+
+
+# ---------------------------------------------------------------------------
 # Images
 # ---------------------------------------------------------------------------
 
@@ -141,10 +167,17 @@ def render_book(
     drafts: DraftBook,
     out_dir: str | Path,
     book_id: str = "",
+    refine_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Assemble ``book.md`` + ``manifest.json``; returns the manifest."""
+    """Assemble ``book.md`` + ``manifest.json``; returns the manifest.
+
+    When ``refine_dir`` is given, verified refinement results (M2) override
+    the raw draft texts for all chunks whose refinement is still fresh.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if refine_dir is not None:
+        _apply_refinements(drafts, Path(refine_dir))
     urls = extract_images(book, out_dir / "images")
 
     # block-id -> (chunk, ordered unit dicts); each block lives in exactly
@@ -184,6 +217,9 @@ def render_book(
     translated_units = sum(
         1 for meta in drafts.meta_by_chunk.values() for _ in meta.get("units", [])
     )
+    refined_units = sum(
+        1 for u in drafts.unit_texts.values() if u.get("refined")
+    )
     manifest: dict[str, Any] = {
         "book_id": book_id or out_dir.parent.name,
         "pages": book.num_pages,
@@ -192,6 +228,7 @@ def render_book(
         "chunks_total": len(chunks),
         "chunks_translated": len(drafts.meta_by_chunk),
         "units_translated": translated_units,
+        "units_refined": refined_units,
         "chunks": [],
     }
     for chunk_id in drafts.chunk_ids():

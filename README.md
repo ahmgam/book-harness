@@ -151,8 +151,8 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 
 ## Roadmap
 
-- **M1 — MVP:** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
-- **M2 — Accuracy:** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + deterministic compliance audit + model bake-off.
+- **M1 — MVP (done):** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
+- **M2 — Accuracy (implemented):** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + compliance/consistency audits + OCR gate + model bake-off. Task 2.7 exit criteria (bake-off report + held-out QE improvement) need a real local model run.
 - **M3 — Artifacts:** glossary appendix, bilingual HTML, QA report, provenance manifest, TMX, glossary drift loop.
 - **M3.5 — MCP server:** glossary lookup + chunk translation exposed as MCP tools for agent-driven workflows.
 - **M4 — Web UI:** SSE progress streaming + human review of `uncertified` terms and low-QE chunks.
@@ -168,7 +168,7 @@ See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
 ## Status
 
-**M1 (MVP) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → resumable `book.md` assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11); task 1.12 (full-book validation) is run with:
+**M1 (MVP) + M2 (accuracy) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → resumable `book.md` assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6); the validation runs (1.12, M2 exit criteria) require a real local model:
 
 ```bash
 book-harness run <main-ocr-json>            # full book (local model required)
@@ -178,6 +178,45 @@ book-harness run <main-ocr-json> --pages 30 45 --model llama3.1:8b   # smoke
 Run artifacts land in `runs/<book-id>/` (see below). Every stage is resumable; drafts are keyed by `hash(source_chunk + glossary_version + model + prompt_version)`.
 
 > Verified checklist (PLAN §3): arabterm db loads with domain → dictionary whitelists (aerospace-engineering, information-tech, …); Hy-MT2-30B-A3B GGUF is available for Ollama (`ollama pull melashri/hy-mt2-30b-a3b`); GLiNER works when the `gliner` extra + HF access are available and the pipeline falls back to n-gram mining otherwise.
+
+## Refinement & QA (M2)
+
+Implemented on top of the M1 pipeline; the full `run` now goes
+**source → terms → glossary → chunk → gate → translate → qe → refine → compliance → consistency → assemble**.
+
+| Stage | What it does | Artifacts (`06_qa/`, `05_refine/`) |
+|---|---|---|
+| `gate` (2.6) | Pre-translation OCR QA: `page_stats` extraction method + block sanity (junk ratio, fragmented short paragraphs, empty headers) flags suspicious pages before any model spend | `gate.jsonl` |
+| `qe` (2.1) | Reference-free quality estimation per chunk. cometkiwi when the optional `unbabel-comet` stack is installed; otherwise an LLM judge scoring every unit 0–100 (average → chunk score) | `qe-scores.jsonl` |
+| `refine` (2.2 + 2.3) | Guarded loop on the worst-scoring chunks first: ① a general-instruct model locates ≤12 MQM error spans per unit; ② pure-Python literal substring patches (spans must match exactly once); ③ A/B verify run twice with swapped positions — a patch is applied only on a 2/2 vote, otherwise the draft text stays | `chunk-NNNN.spans.json`, `chunk-NNNN.patches.jsonl`, `chunk-NNNN.verdicts.jsonl`, `chunk-NNNN.refined.json` |
+| `compliance` (2.4) | Certified-glossary enforcement per chunk through the shared Arabic normalizer with clitic tolerance (ال، وال، بال، لل…). Chunks below the floor are **re-queued for targeted re-translation**: the violated term pairs are injected as a MANDATORY glossary block and folded into the chunk's cache key, so only offending chunks regenerate | `compliance.jsonl` |
+| `consistency` (2.5) | Book-wide drift audit: the certified rendering of each term vs. its dictionary alternatives — a chunk using an alternative form where the certified form is expected is reported | `consistency.jsonl` |
+
+Assembly prefers verified refined unit texts (`refined.json`, only when its recorded draft cache key still matches — a re-translated chunk automatically expires its refinement).
+
+### M2 options
+
+```bash
+book-harness run <main-ocr-json> \
+  --qe-method auto           # auto | judge | comet | none
+  --no-refine                # skip estimate/patch/verify
+  --quality-threshold 80     # skip refinement for chunks scoring >= 80
+  --refine-budget 50         # cap chunks refined per pass (None = all below threshold)
+  --max-spans 12             # MQM spans per unit
+  --compliance-floor 95      # re-translate chunks below 95% glossary compliance
+  --no-requeue               # keep violations, don't re-translate
+```
+
+### Model bake-off (2.7)
+
+```bash
+book-harness run <main-ocr-json> --no-translate          # prepare chunks + glossary once
+book-harness bakeoff <main-ocr-json> \
+  --models hy-mt2-30b-a3b hy-mt2-7b translategemma-12b \
+  --chunks 30 --judge qwen3.5-27b
+```
+
+Translates an even sample of chunks through every installed candidate in an isolated `06_qa/bakeoff/<model>/` sandbox, scores with QE-judge + compliance, and writes `bakeoff.json` / `bakeoff.md` with an empirical recommendation (composite = `0.6*QE + 0.4*compliance`). Scores use a separate judge model; the bias is logged when the judge is also a candidate.
 
 ## Usage
 
