@@ -12,6 +12,8 @@ Pipeline stages (see PLAN.md, milestones M1..M3):
     06_qa/drift   glossary drift mining -> uncertified candidates
     07_output     book.md + provenance manifest + glossary appendix,
                   bilingual HTML + QA report + TMX translation memory
+    serve         M4: review UI — SSE stage/chunk progress + human review
+                  of uncertified terms / low-QE chunks (writes back)
 
 Everything lands on disk; every stage can be re-run or resumed.
 """

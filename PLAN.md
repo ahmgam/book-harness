@@ -34,7 +34,7 @@ book-harness/
     normalize.py         # Arabic text normalization (shared by enforcement + QA)
     state.py             # run state.json, resume logic, cache keys
     cli.py               # thin CLI over the library
-  mcp/                   # (M3.5) MCP server wrapping glossary + translation
+  mcp/                   # (M3.5) MCP agent workflow guide (AGENT.md); the server itself lives in book_harness/mcp_server.py to avoid shadowing the official `mcp` SDK package
   web/                   # (M4) review UI
   runs/<book-id>/        # per-book artifacts (see §4)
   tests/

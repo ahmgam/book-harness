@@ -33,15 +33,21 @@ STAGE_DIRS = {
 TRANSLATION = "en"
 TARGET = "ar"
 
-#: Preference-ordered translation models. The first one found in the local
-#: Ollama instance is used (see translate.OllamaClient.pick_model).
+#: Preference-ordered translation models. The first one found on the local
+#: server is used (see translate.build_client / *_Client.pick_model).
 TRANSLATION_MODELS = ["hy-mt2-30b-a3b", "hy-mt2-7b", "qwen2.5:14b", "llama3.1:8b"]
 #: General instruct model used for non-translation LLM calls (rolling summary).
 #: Kept swappable so a task-appropriate model can serve both roles in M1.
 ASSIST_MODELS = TRANSLATION_MODELS
 
+#: Default serving backend is Ollama (native ``/api/generate``). A host URL
+#: ending in ``/v1`` auto-selects the OpenAI-compatible chat-completions API
+#: instead (vLLM / llama.cpp server / LM Studio …); override with
+#: ``BOOK_HARNESS_API`` / the CLI ``--api`` flag.
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_TIMEOUT = int(os.environ.get("BOOK_HARNESS_OLLAMA_TIMEOUT", "900"))
+API_DEFAULT = "auto"            # auto | ollama | openai
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 GENERATE_OPTIONS = {"temperature": 0.0, "num_ctx": 8192, "seed": 42}
 
@@ -203,6 +209,8 @@ class Settings:
     model: str | None = None                 # force a translation model
     ollama_host: str = OLLAMA_HOST
     ollama_timeout: int = OLLAMA_TIMEOUT
+    api: str | None = None                   # auto (default) | ollama | openai
+    api_key: str = OPENAI_API_KEY            # Bearer key for openai endpoints
     domains: tuple[str, ...] = DEFAULT_DOMAINS
     char_ceiling: int = CHAR_CEILING
     char_floor: int = MIN_CHUNK_CHARS

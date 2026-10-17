@@ -90,8 +90,10 @@ runs/<book-id>/
                       drift-candidates.jsonl (uncertified proposals)
   03_chunks/          chunk-0001.json (block ids, source, placeholders, hash)
   04_drafts/          chunk-0001.md + .meta.json (model, prompt, glossary ver)
+                      requeued/           drafts archived when re-queued for review
   05_refine/          chunk-0001.spans.json, patches.jsonl, verdicts.jsonl
-  06_qa/              qe-scores.jsonl, compliance.jsonl, consistency.jsonl
+  06_qa/              qe-scores.jsonl, compliance.jsonl, consistency.jsonl,
+                      review-log.jsonl (M4 human decisions, append-only)
   07_output/          book.md, manifest.json, glossary-appendix.md,
                       bilingual.html, qa-report.md, book.tmx
   state.json          stage cursor for resume
@@ -157,8 +159,8 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 - **M1 — MVP (done):** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
 - **M2 — Accuracy (implemented):** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + compliance/consistency audits + OCR gate + model bake-off. Task 2.7 exit criteria (bake-off report + held-out QE improvement) need a real local model run.
 - **M3 — Artifacts (implemented):** glossary appendix, bilingual HTML, QA report, provenance manifest, TMX export, glossary drift loop (`drift` command + drift stage), outline repair. Artifact exit criteria (3.1–3.5) run on real data; 3.6 human confirmation is CLI-driven.
-- **M3.5 — MCP server:** glossary lookup + chunk translation exposed as MCP tools for agent-driven workflows.
-- **M4 — Web UI:** SSE progress streaming + human review of `uncertified` terms and low-QE chunks.
+- **M3.5 — MCP server (implemented):** `book-harness-mcp` — a dependency-free MCP stdio server (`book_harness/mcp_server.py`) exposing `lookup_term`, `get_glossary`, `translate_chunk`, `list_runs` for agent-driven workflows, with the agent workflow guide in [`mcp/AGENT.md`](./mcp/AGENT.md).
+- **M4 — Web UI (implemented):** `book-harness serve` — SSE progress streaming from `state.json` + human review of `uncertified` terms and low-QE chunks; decisions write back to `glossary.yaml` and re-queue only the affected chunks.
 
 See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
@@ -171,11 +173,13 @@ See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
 ## Status
 
-**M1 (MVP) + M2 (accuracy) + M3 (artifacts) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → outline repair → glossary drift loop → appendix/bilingual/TMX/QA-report/manifest assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6, M3 tasks 3.1–3.7); the validation runs (1.12, M2 exit criteria) require a real local model:
+**M1 (MVP) + M2 (accuracy) + M3 (artifacts) + M3.5 (MCP server) + M4 (web UI) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → outline repair → glossary drift loop → appendix/bilingual/TMX/QA-report/manifest assembly → MCP tools for agent-driven runs → serve with live SSE progress + human review (uncertified terms, low-QE chunks) writing back to the artifacts. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6, M3 tasks 3.1–3.7, M3.5 tasks 3.5.1–3.5.2, M4 tasks 4.1–4.2); the validation runs (1.12, M2 exit criteria) require a real local model:
 
 ```bash
 book-harness run <main-ocr-json>            # full book (local model required)
 book-harness run <main-ocr-json> --pages 30 45 --model llama3.1:8b   # smoke
+book-harness serve runs/<book-id>           # M4 review UI (progress + review)
+book-harness-mcp                            # M3.5 MCP stdio server (agents)
 ```
 
 Run artifacts land in `runs/<book-id>/` (see below). Every stage is resumable; drafts are keyed by `hash(source_chunk + glossary_version + model + prompt_version)`.
@@ -259,6 +263,54 @@ book-harness run <main-ocr-json> \
   --no-artifacts            # skip appendix/bilingual/TMX/QA-report generation
 ```
 
+## MCP server (M3.5)
+
+A dependency-free MCP server (`book_harness/mcp_server.py`, newline-delimited
+JSON-RPC 2.0 over stdio — no third-party SDK) that wraps the library's
+glossary and translation tools for agent-driven workflows:
+
+```bash
+book-harness-mcp                            # spawn from your MCP client
+python -m book_harness.mcp_server           # same, without the console script
+```
+
+| Tool (3.5.1) | What it does |
+|---|---|
+| `lookup_term(term, lang, domain)` | Certified arabterm hits as **citations** (Arabic term, source dictionary, Wikidata ID, printed page, archive.org scan); `domain` filters through the same dictionary whitelist the pipeline uses; `lang=ar` is a reverse lookup |
+| `get_glossary(book_id, term?)` | A run's `glossary.yaml`: version + cited entries with `certified/llm_chosen/uncertified` status, optionally narrowed to one term (or a `run_root` outside the default) |
+| `translate_chunk(text, glossary, context)` | One unit of text through the local Ollama model with glossary injection (Hy-MT2 official template) + prior context — the exact prompt path the pipeline uses; optional `model`/`kind` overrides |
+| `list_runs()` | Every run under the runs root: stage statuses from `state.json`, chunk/translated counts, glossary version, assembled flag |
+
+Tool execution errors come back as MCP `isError` results (never crash the
+server); run locations follow the `BOOK_HARNESS_RUNS` env var, model/serving
+the usual `OLLAMA_HOST` / `BOOK_HARNESS_OLLAMA_TIMEOUT`. The agent workflow
+guide — how Claude/Copilot drives a **full book translation** through these
+tools while respecting the placeholder/glossary/resume contracts — is
+[`mcp/AGENT.md`](./mcp/AGENT.md) (task 3.5.2).
+
+## Web review UI (M4)
+
+A stdlib-only server (no extra dependencies) that wraps the run directory:
+
+```bash
+book-harness serve runs/<book-id>            # then open http://127.0.0.1:8000/
+```
+
+| Capability (task) | What it does |
+|---|---|
+| Progress view (4.1) | Live stage table + chunk-translation bar fed by `GET /events` (Server-Sent Events): the server polls `state.json` and the drafts directory and pushes `event: progress` frames whenever the snapshot changes, with heartbeats between changes |
+| Term review (4.2) | Lists `uncertified` glossary entries merged with `proposed` drift-candidates (deduped). **Approve** stores the reviewed Arabic rendering (`decided_by: human`, `status: uncertified` — human review never self-certifies), **Reject** flags it unusable |
+| Chunk review (4.2) | Lists chunks below the QE quality threshold, worst first, with source/translation side by side. **Re-queue** archives the draft to `04_drafts/requeued/<n>_<chunk>.{md,meta.json}`, so its cache key disappears and the next `translate` pass regenerates *only that chunk* |
+
+Write-backs are audited in `06_qa/review-log.jsonl`; approving a term with an
+Arabic rendering also resolves its proposal in `drift-candidates.jsonl` and
+re-queues the chunks that contain it (via `drift.affected_chunks`).
+
+The library parts (`book_harness/web.py` — `overview`,
+`uncertified_terms`, `low_qe_chunks`, `apply_term_decision`, `requeue_chunk`,
+`progress_stream`) are plain file-I/O functions; the HTTP shell is thin
+(`http.server` + embedded single-page UI, no build step).
+
 ## Usage
 
 ```bash
@@ -266,4 +318,23 @@ python -m venv .venv && .venv/bin/pip install -e ".[tests]"
 .venv/bin/book-harness run path/to/ocr_main.json [options]
 ```
 
-Key options: `--model` (force a translation model), `--domains aerospace`, `--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after chunking), `--no-drift`/`--no-artifacts` (M3 stages).
+Key options: `--model` (force an installed model), `--domains aerospace`,
+`--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after
+chunking), `--no-drift`/`--no-artifacts` (M3 stages).
+
+### Model serving
+
+Default backend is **Ollama** (`OLLAMA_HOST`, default `http://localhost:11434`).
+Point `--ollama-host` at an **OpenAI-compatible server** (vLLM, llama.cpp
+`llama-server`, LM Studio…) and the wire protocol switches automatically —
+the client detects a base URL ending in `/v1` and speaks
+`GET /v1/models` + `POST /v1/chat/completions`; force it with `--api
+ollama|openai` (env `BOOK_HARNESS_API`). OpenAI endpoints accept an API key
+via `--api-key` or env `OPENAI_API_KEY` (sent as a Bearer header). Model
+selection is identical in both protocols: the first of the
+`TRANSLATION_MODELS` preference list that is actually installed, or `--model`.
+
+```bash
+book-harness run ocr.json --ollama-host http://vllm:8000/v1 --model Qwen/Qwen3.5-27B   # OpenAI-compatible
+book-harness run ocr.json                                        # plain Ollama, unchanged
+```

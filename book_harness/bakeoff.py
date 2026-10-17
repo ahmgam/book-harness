@@ -25,7 +25,7 @@ from typing import Any
 from book_harness import config
 from book_harness.assemble import DraftBook
 from book_harness.qa import compliance_audit, qe_score_chunk
-from book_harness.translate import OllamaClient, SummaryTracker, translate_chunk
+from book_harness.translate import SummaryTracker, build_client, translate_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -122,23 +122,25 @@ def run_bakeoff(
         slug = model.replace("/", "_").replace(":", "-")
         dir_m = out_dir / slug
         drafts_dir = dir_m / "04_drafts"
-        client = OllamaClient(
-            host=settings.ollama_host,
-            timeout=settings.ollama_timeout,
-            preferred=[model],
-        )
+        started = time.time()
+        translated = 0
+        try:
+            client = build_client(
+                settings.ollama_host,
+                timeout=settings.ollama_timeout,
+                preferred=[model],
+                api=settings.api,
+                api_key=settings.api_key,
+                model=model,
+            )
+        except (RuntimeError, ConnectionError, ValueError) as exc:
+            results[model] = {"error": str(exc)}
+            logger.warning("bake-off: model %s unavailable: %s", model, exc)
+            continue
         summaries = SummaryTracker(
             client, drafts_dir / "chapter-summary.json",
             period=settings.summary_period,
         )
-        started = time.time()
-        translated = 0
-        try:
-            client.pick_model(model)
-        except (RuntimeError, ConnectionError) as exc:
-            results[model] = {"error": str(exc)}
-            logger.warning("bake-off: model %s unavailable: %s", model, exc)
-            continue
         for c in sample:
             translate_chunk(
                 c.to_dict(), client, entries, drafts_dir,
@@ -167,17 +169,20 @@ def run_bakeoff(
 
 def _judge_client(settings: Any, judge_model: str | None) -> Any:
     """QE judge = an assist model, never the model under test when avoidable."""
-    client = OllamaClient(
-        host=settings.ollama_host,
-        timeout=settings.ollama_timeout,
-        preferred=config.ASSIST_MODELS,
-    )
+    client: Any
     try:
-        client.pick_model(judge_model)
+        client = build_client(
+            settings.ollama_host,
+            timeout=settings.ollama_timeout,
+            preferred=config.ASSIST_MODELS,
+            api=settings.api,
+            api_key=settings.api_key,
+            model=judge_model,
+        )
         if judge_model and judge_model.rstrip(":") not in (client.model or ""):
             # same family as a bake-off candidate — note the bias in logs
             logger.warning("judge %s is also a bake-off candidate; scores may be biased", client.model)  # noqa: E501
-    except (RuntimeError, ConnectionError) as exc:
+    except (RuntimeError, ConnectionError, ValueError) as exc:
         logger.warning("no dedicated judge: %s; QE scoring disabled in report", exc)
         return _NullClient()
     return client

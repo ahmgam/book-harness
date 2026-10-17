@@ -24,12 +24,27 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from book_harness.config import GENERATE_OPTIONS, GLOSSARY_TEMPLATE, SYSTEM_PROMPT
+from book_harness.config import (
+    GENERATE_OPTIONS,
+    GLOSSARY_TEMPLATE,
+    OPENAI_API_KEY,
+    OLLAMA_HOST,
+    OLLAMA_TIMEOUT,
+    SYSTEM_PROMPT,
+    TRANSLATION_MODELS,
+)
 from book_harness.state import cache_key
 
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"§(?P<kind>[A-Z]+)-(?P<n>\d+)§")
+
+#: Options keys understood by OpenAI-style chat-completions endpoints.
+#: ``num_ctx`` is llama.cpp/Ollama context-window sizing and is dropped here.
+OPENAI_OPTION_KEYS = (
+    "temperature", "top_p", "seed", "stop", "max_tokens",
+    "presence_penalty", "frequency_penalty",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -76,47 +91,11 @@ class OllamaClient:
         return sorted(m.get("name", "") for m in tags.get("models", []))
 
     def pick_model(self, model_override: str | None = None) -> str:
-        installed = self.list_models()
-        if not installed:
-            raise RuntimeError("Ollama has no models installed (`ollama list` is empty)")
-        self._installed = installed
-        if model_override:
-            if self._matches(installed, model_override):
-                self.model = _canonical(installed, model_override)
-            else:
-                raise RuntimeError(
-                    f"model '{model_override}' not installed in Ollama; "
-                    f"available: {installed}"
-                )
-            return self.model
-        for cand in self.preferred:
-            if self._matches(installed, cand):
-                self.model = _canonical(installed, cand)
-                logger.info("translation model: %s", self.model)
-                return self.model
-        self.model = installed[0]
-        logger.warning(
-            "none of the preferred models %s installed; using '%s'",
-            self.preferred, self.model,
-        )
-        return self.model
+        return _pick_model_installed(self, model_override)
 
     @staticmethod
     def _matches(installed: list[str], want: str) -> bool:
-        want = want.lower()
-        for name in installed:
-            n = name.lower()
-            bare = n.split("/")[-1].split(".")[0]
-            if (
-                n == want
-                or n.startswith(want + ":")
-                or n == want + ":latest"
-                or bare == want
-                or bare.startswith(want + ":")
-                or bare == want + ":latest"
-            ):
-                return True
-        return False
+        return model_matches(installed, want)
 
     def generate(
         self, prompt: str, *, system: str | None = None, options: dict | None = None
@@ -135,13 +114,211 @@ class OllamaClient:
         return (out.get("response") or "").strip()
 
 
-def _canonical(installed: list[str], want: str) -> str:
-    want = want.lower()
+def model_matches(installed: list[str], want: str) -> bool:
+    """Case-insensitive model matching tolerant of ``:tag`` and ``org/name``."""
+    want = (want or "").lower()
+    for name in installed:
+        n = name.lower()
+        bare = n.split("/")[-1].split(".")[0]
+        if (
+            n == want
+            or n.startswith(want + ":")
+            or n == want + ":latest"
+            or bare == want
+            or bare.startswith(want + ":")
+            or bare == want + ":latest"
+        ):
+            return True
+    return False
+
+
+def _canonical_name(installed: list[str], want: str) -> str:
+    want = (want or "").lower()
     for name in installed:
         n = name.lower()
         if n == want or n.startswith(want + ":") or n == want + ":latest":
             return name
     return want
+
+
+def _pick_model_installed(
+    client: Any, model_override: str | None = None
+) -> str:
+    """Shared pick_model implementation (OllamaClient + OpenAIClient)."""
+    installed = client.list_models()
+    if not installed:
+        raise RuntimeError(
+            f"no models available at {client.host} "
+            f"(endpoint returned an empty list)"
+        )
+    client._installed = installed
+    if model_override:
+        if model_matches(installed, model_override):
+            client.model = _canonical_name(installed, model_override)
+        else:
+            raise RuntimeError(
+                f"model '{model_override}' not installed on the server at "
+                f"{client.host}; available: {installed}"
+            )
+        return client.model
+    for cand in client.preferred:
+        if model_matches(installed, cand):
+            client.model = _canonical_name(installed, cand)
+            logger.info("translation model: %s", client.model)
+            return client.model
+    client.model = installed[0]
+    logger.warning(
+        "none of the preferred models %s installed; using '%s'",
+        client.preferred, client.model,
+    )
+    return client.model
+
+
+def app_base(host: str) -> str:
+    """Normalize a server base URL, keeping an explicit ``/v1`` suffix."""
+    return (host or "").strip().rstrip("/")
+
+
+def is_openai_base(host: str) -> bool:
+    """A host URL ending in ``/v1`` selects the OpenAI-compatible API."""
+    return app_base(host).endswith("/v1")
+
+
+class OpenAIClient:
+    """Stdlib client for OpenAI-compatible servers (vLLM, llama.cpp server,
+    LM Studio, TGI …): ``GET /v1/models`` + ``POST /v1/chat/completions``.
+
+    Same duck-type surface as :class:`OllamaClient` (``.model``,
+    ``list_models``, ``pick_model``, ``generate(prompt, system, options)``),
+    so the whole pipeline works unchanged. The base host may be written with
+    or without the ``/v1`` suffix; requests go to ``{host}/v1/…`` either way.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        timeout: int = 900,
+        preferred: list[str] | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        base = app_base(host)
+        if not base:
+            raise ValueError("openai host must be a base URL")
+        self.host = base if base.endswith("/v1") else base + "/v1"
+        self.timeout = timeout
+        self.preferred = preferred or []
+        self.api_key = api_key or ""
+        self.model: str | None = None
+
+    # -- transport -----------------------------------------------------------
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _post(self, path: str, payload: dict, timeout: int | None = None) -> dict:
+        req = urllib.request.Request(
+            self.host + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            raise ConnectionError(
+                f"OpenAI-compatible server not reachable at {self.host}{path}: {exc}"
+            ) from exc
+
+    def _get(self, path: str) -> Any:
+        req = urllib.request.Request(
+            self.host + path, headers=self._headers(), method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            raise ConnectionError(
+                f"OpenAI-compatible server not reachable at {self.host}{path}: {exc}"
+            ) from exc
+
+    # -- api ------------------------------------------------------------------
+    def list_models(self) -> list[str]:
+        data = self._get("/models")
+        models = data.get("data") if isinstance(data, dict) else data
+        return sorted(
+            m.get("id") if isinstance(m, dict) else str(m) for m in (models or [])
+        )
+
+    pick_model = OllamaClient.pick_model          # shared implementation
+    _matches = OllamaClient._matches              # shared, module-level logic
+
+    def generate(
+        self, prompt: str, *, system: str | None = None, options: dict | None = None
+    ) -> str:
+        if not self.model:
+            raise RuntimeError("pick_model() must be called before generate()")
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        passed = {**GENERATE_OPTIONS, **(options or {})}
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            **{k: passed[k] for k in OPENAI_OPTION_KEYS if k in passed},
+        }
+        out = self._post("/chat/completions", payload)
+        choices = out.get("choices") or []
+        if not choices:
+            raise RuntimeError(
+                f"no choices in chat-completions response: {str(out)[:200]}"
+            )
+        return (choices[0].get("message", {}).get("content") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Client factory (task M2.7-era Ollama default + OpenAI-compatible option)
+# ---------------------------------------------------------------------------
+
+def build_client(
+    host: str = "",
+    *,
+    timeout: int | None = None,
+    preferred: list[str] | None = None,
+    model: str | None = None,
+    api: str | None = None,
+    api_key: str | None = None,
+) -> Any:
+    """Construct, model-pick and return the right client for ``host``.
+
+    ``api`` selects the wire protocol:
+    * ``None`` / ``"auto"`` — OpenAI-compatible when the host URL ends in
+      ``/v1``, otherwise Ollama (**default: Ollama**, per PLAN §3);
+    * ``"ollama"`` / ``"openai"`` — force one.
+    """
+    host = host or OLLAMA_HOST
+    timeout = timeout or OLLAMA_TIMEOUT
+    preferred = preferred or TRANSLATION_MODELS
+    kind = (api or "auto").lower()
+    if kind == "auto":
+        kind = "openai" if is_openai_base(host) else "ollama"
+    if kind == "openai":
+        client: Any = OpenAIClient(
+            host=host,
+            timeout=timeout,
+            preferred=preferred,
+            api_key=api_key or OPENAI_API_KEY,
+        )
+    elif kind == "ollama":
+        client = OllamaClient(host=host, timeout=timeout, preferred=preferred)
+    else:
+        raise ValueError(f"unknown api kind: {kind!r} (ollama|openai|auto)")
+    client.pick_model(model)
+    return client
 
 
 # ---------------------------------------------------------------------------

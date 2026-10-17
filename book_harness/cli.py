@@ -2,6 +2,7 @@
 
     book-harness run <main-ocr-json> [options]      # full pipeline
     book-harness stages                             # describe the stages
+    book-harness serve runs/<book-id>               # M4: review UI (progress + review)
 """
 
 from __future__ import annotations
@@ -83,11 +84,7 @@ def stage_chunk(settings: Settings, book: Book) -> list:
 
 
 def stage_translate(settings: Settings, chunks: list) -> int:
-    from book_harness.translate import (
-        OllamaClient,
-        SummaryTracker,
-        translate_chunk,
-    )
+    from book_harness.translate import SummaryTracker, build_client, translate_chunk
 
     if settings.pages:
         lo, hi = settings.pages
@@ -99,11 +96,13 @@ def stage_translate(settings: Settings, chunks: list) -> int:
     if settings.max_chunks:
         chunks = chunks[: settings.max_chunks]
     drafts_dir = settings.stage_dir(stage="drafts")
-    client = OllamaClient(
-        host=settings.ollama_host, timeout=settings.ollama_timeout,
-        preferred=config.TRANSLATION_MODELS,
+    client = build_client(
+        settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        api=settings.api,
+        api_key=settings.api_key,
+        model=settings.model,
     )
-    client.pick_model(settings.model)
     _, entries, _ = _load_glossary(settings)
     summaries = SummaryTracker(
         client,
@@ -141,15 +140,16 @@ def _drafts_meta(settings: Settings) -> dict[str, dict]:
 
 
 def _assist_client(settings: Settings):
-    from book_harness.translate import OllamaClient
+    from book_harness.translate import build_client
 
-    client = OllamaClient(
-        host=settings.ollama_host,
+    return build_client(
+        settings.ollama_host,
         timeout=settings.ollama_timeout,
         preferred=config.ASSIST_MODELS,
+        api=settings.api,
+        api_key=settings.api_key,
+        model=settings.model,          # explicit model also steers QA roles
     )
-    client.pick_model(settings.model)          # explicit model also steers QA roles
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +518,7 @@ def drift_confirm(
     chunks that contain them (cache keys change only for those chunks)."""
     from book_harness import drift as drift_mod
     from book_harness.chunker import load_chunks
-    from book_harness.translate import OllamaClient, SummaryTracker, translate_chunk
+    from book_harness.translate import SummaryTracker, build_client, translate_chunk
 
     run_dir = settings.run_dir()
     chunks = load_chunks(run_dir / config.STAGE_DIRS["chunks"])
@@ -550,11 +550,13 @@ def drift_confirm(
     # other chunks' translated drafts stay fresh (same hook the M2 compliance
     # re-queue uses).
     drafts_dir = settings.stage_dir(stage="drafts")
-    client = OllamaClient(
-        host=settings.ollama_host, timeout=settings.ollama_timeout,
-        preferred=config.TRANSLATION_MODELS,
+    client = build_client(
+        settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        api=settings.api,
+        api_key=settings.api_key,
+        model=settings.model,
     )
-    client.pick_model(settings.model)
     summaries = SummaryTracker(
         client, drafts_dir / "chapter-summary.json",
         period=settings.summary_period,
@@ -693,6 +695,21 @@ def run(settings: Settings) -> int:
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+def _add_server_flags(p: argparse.ArgumentParser) -> None:
+    """Host/api/key flags shared by every command that talks to a model
+    server. Default serving backend stays Ollama ('auto' only auto-detects
+    OpenAI-compatible servers from a host URL ending in /v1)."""
+    p.add_argument("--ollama-host", default=config.OLLAMA_HOST,
+                   help="model server base URL (Ollama default; a URL ending "
+                        "in /v1 uses the OpenAI-compatible API)")
+    p.add_argument("--api", choices=["auto", "ollama", "openai"],
+                   default=config.API_DEFAULT,
+                   help="wire protocol: auto-detected from the host URL "
+                        "(default) or forced")
+    p.add_argument("--api-key", default=config.OPENAI_API_KEY,
+                   help="API key for OpenAI-compatible endpoints "
+                        "(env OPENAI_API_KEY); sent as a Bearer header")
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="book-harness",
@@ -703,8 +720,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="run the full pipeline")
     run_p.add_argument("ocr_json", type=Path, help="main OCR JSON file")
     run_p.add_argument("--run-root", type=Path, default=Path("runs"))
-    run_p.add_argument("--model", default=None, help="force a translation model (Ollama)")
-    run_p.add_argument("--ollama-host", default=config.OLLAMA_HOST)
+    run_p.add_argument("--model", default=None,
+                       help="force a translation model (Ollama name or ID)")
+    _add_server_flags(run_p)
     run_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
     run_p.add_argument("--char-ceiling", type=int, default=config.CHAR_CEILING)
     run_p.add_argument("--char-floor", type=int, default=config.MIN_CHUNK_CHARS)
@@ -755,8 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
     bake_p.add_argument("--judge", default=None,
                         help="force a QE judge model (default: assist preference)")
     bake_p.add_argument("--run-root", type=Path, default=Path("runs"))
-    bake_p.add_argument("--ollama-host", default=config.OLLAMA_HOST)
     bake_p.add_argument("--ollama-timeout", type=int, default=config.OLLAMA_TIMEOUT)
+    _add_server_flags(bake_p)
     bake_p.add_argument("--max-chunks", type=int, default=None)
     bake_p.add_argument("--pages", nargs=2, type=int, metavar=("LO", "HI"))
     bake_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
@@ -781,8 +799,21 @@ def build_parser() -> argparse.ArgumentParser:
     drift_p.add_argument("--model", default=None, help="force a translation model")
     drift_p.add_argument("--run-root", type=Path, default=Path("runs"))
     drift_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
-    drift_p.add_argument("--ollama-host", default=config.OLLAMA_HOST)
+    _add_server_flags(drift_p)
     drift_p.add_argument("--log-level", default="INFO")
+
+    serve_p = sub.add_parser(
+        "serve",
+        help="M4: review UI — live stage/chunk progress (SSE) + human review "
+             "of uncertified terms and low-QE chunks",
+    )
+    serve_p.add_argument("run_dir", type=Path,
+                         help="run directory (runs/<book-id>)")
+    serve_p.add_argument("--host", default="127.0.0.1")
+    serve_p.add_argument("--port", type=int, default=8000)
+    serve_p.add_argument("--poll-seconds", type=float, default=1.0,
+                         help="SSE poll interval for state/chunk changes")
+    serve_p.add_argument("--log-level", default="INFO")
     return p
 
 
@@ -791,6 +822,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stages":
         for i, s in enumerate(STAGES, 1):
             print(f"{i}. {s}")
+        return 0
+
+    if args.command == "serve":                 # needs no OCR input
+        from book_harness import web
+
+        setup_logging(args.log_level)
+        try:
+            web.serve(
+                args.run_dir, host=args.host, port=args.port,
+                poll_seconds=args.poll_seconds,
+            )
+        except FileNotFoundError as exc:
+            logger.error("%s", exc)
+            return 2
         return 0
 
     setup_logging(args.log_level)
@@ -808,6 +853,8 @@ def main(argv: list[str] | None = None) -> int:
         model=getattr(args, "model", None),
         ollama_host=args.ollama_host,
         ollama_timeout=getattr(args, "ollama_timeout", config.OLLAMA_TIMEOUT),
+        api=getattr(args, "api", None),
+        api_key=getattr(args, "api_key", "") or "",
         domains=tuple(args.domains),
         char_ceiling=getattr(args, "char_ceiling", config.CHAR_CEILING),
         char_floor=getattr(args, "char_floor", config.MIN_CHUNK_CHARS),

@@ -22,6 +22,8 @@ tests = ["pytest>=8.0"]
 
 [project.scripts]
 book-harness = "book_harness.cli:main"
+# M3.5: MCP stdio server wrapping glossary + translation tools
+book-harness-mcp = "book_harness.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["book_harness*"]
