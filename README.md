@@ -84,25 +84,28 @@ Chunks are **section-aligned** (consecutive content blocks within one outline se
 
 ```text
 runs/<book-id>/
-  00_source/          OCR JSON pair, consolidated Book model, extracted images
+  00_source/          OCR JSON pair, book-summary.json, outline-repair.json
   01_profile/         domain.json, style.md, entities.jsonl
-  02_glossary/        candidates.jsonl, glossary.yaml (versioned), audit.md
+  02_glossary/        candidates.jsonl, glossary.yaml (versioned),
+                      drift-candidates.jsonl (uncertified proposals)
   03_chunks/          chunk-0001.json (block ids, source, placeholders, hash)
   04_drafts/          chunk-0001.md + .meta.json (model, prompt, glossary ver)
   05_refine/          chunk-0001.spans.json, patches.jsonl, verdicts.jsonl
   06_qa/              qe-scores.jsonl, compliance.jsonl, consistency.jsonl
-  07_output/          book.md / book.html, glossary-appendix.md, manifest.json
+  07_output/          book.md, manifest.json, glossary-appendix.md,
+                      bilingual.html, qa-report.md, book.tmx
   state.json          stage cursor for resume
 ```
 
 ## Outputs
 
-- Translated **markdown/HTML** book (structure, equations, code, and images preserved)
-- **Glossary appendix** — term, chosen translation, source dictionary, page, Wikidata link
-- **Bilingual side-by-side edition** (paragraph-aligned HTML)
-- **QA report** per chapter — QE distribution, glossary compliance %, patch counts, uncertified terms
-- **Provenance manifest** — per chunk: model, prompt version, glossary version, timestamps
-- **TMX export** — aligned pairs as reusable translation memory
+- Translated **markdown** book (structure, equations, code, and images preserved)
+- **Glossary appendix** — term, chosen translation, source dictionary, first-use page, Wikidata + scan links, grouped by status (M3.1)
+- **Bilingual side-by-side edition** — paragraph-aligned HTML: English source left, Arabic right (RTL), equations/code/figures full-width (M3.2)
+- **QA report** per chapter — QE distribution, compliance %, patch counts, uncertified terms in use (M3.3)
+- **Provenance manifest** — per chunk: model, prompt version, glossary version, cache key, canonical pages, finished/duration timestamps (M3.4)
+- **TMX 1.4 translation memory** — aligned source/translation pairs with section/chunk properties (M3.5)
+- **Glossary drift loop** — recurring uncovered terms mined from the drafts → proposed `uncertified` → human `--confirm` appends to the glossary and re-runs only the affected chunks (M3.6)
 
 ## Known caveats & proposed solutions
 
@@ -153,7 +156,7 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 
 - **M1 — MVP (done):** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
 - **M2 — Accuracy (implemented):** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + compliance/consistency audits + OCR gate + model bake-off. Task 2.7 exit criteria (bake-off report + held-out QE improvement) need a real local model run.
-- **M3 — Artifacts:** glossary appendix, bilingual HTML, QA report, provenance manifest, TMX, glossary drift loop.
+- **M3 — Artifacts (implemented):** glossary appendix, bilingual HTML, QA report, provenance manifest, TMX export, glossary drift loop (`drift` command + drift stage), outline repair. Artifact exit criteria (3.1–3.5) run on real data; 3.6 human confirmation is CLI-driven.
 - **M3.5 — MCP server:** glossary lookup + chunk translation exposed as MCP tools for agent-driven workflows.
 - **M4 — Web UI:** SSE progress streaming + human review of `uncertified` terms and low-QE chunks.
 
@@ -168,7 +171,7 @@ See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
 ## Status
 
-**M1 (MVP) + M2 (accuracy) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → resumable `book.md` assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6); the validation runs (1.12, M2 exit criteria) require a real local model:
+**M1 (MVP) + M2 (accuracy) + M3 (artifacts) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → outline repair → glossary drift loop → appendix/bilingual/TMX/QA-report/manifest assembly. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6, M3 tasks 3.1–3.7); the validation runs (1.12, M2 exit criteria) require a real local model:
 
 ```bash
 book-harness run <main-ocr-json>            # full book (local model required)
@@ -218,6 +221,44 @@ book-harness bakeoff <main-ocr-json> \
 
 Translates an even sample of chunks through every installed candidate in an isolated `06_qa/bakeoff/<model>/` sandbox, scores with QE-judge + compliance, and writes `bakeoff.json` / `bakeoff.md` with an empirical recommendation (composite = `0.6*QE + 0.4*compliance`). Scores use a separate judge model; the bias is logged when the judge is also a candidate.
 
+## Artifacts & robustness (M3)
+
+The full `run` pipeline is now
+**source → outline-repair → terms → glossary → chunk → gate → translate → qe → refine → compliance → consistency → drift → artifacts → assemble**.
+
+| Stage | Task | What it does | Artifacts |
+|---|---|---|---|
+| `outline-repair` (3.7) | Re-derives heading depth from section-numbering patterns (`1` → h1, `1.2` → h2, `1.2.1` → h3) when the OCR `h`-tags mis-nest; a continuity guard leaves stray numerals and unnumbered titles untouched; the outline tree is rebuilt | `00_source/outline-repair.json` |
+| `drift` (3.6) | Mines recurring English n-grams across the *source* chunks that the glossary does not cover → proposed `uncertified` candidates for human review | `02_glossary/drift-candidates.jsonl` |
+| `artifacts` (3.1–3.5) | Writes the glossary appendix, bilingual HTML, QA report and TMX from the stage files — pure file I/O, no model | `07_output/glossary-appendix.md`, `bilingual.html`, `qa-report.md`, `book.tmx` |
+
+The provenance manifest (3.4) is extended in `assemble`: per chunk the model, prompt
+version, glossary version, cache key, source hash, canonical pages, unit counts and the
+finished/duration timestamps — plus the pipeline version and a generation timestamp at the top.
+
+### Drift loop (3.6)
+
+```bash
+# 1. mine proposals (also runs as a stage inside `run`)
+book-harness drift <main-ocr-json> --min-freq 4 --min-df 2
+# 2. human review (see 02_glossary/drift-candidates.jsonl), then confirm:
+book-harness drift <main-ocr-json> --confirm "reverse thrust=الدفع العكسي"
+#    repeatable --confirm TERM[=ARABIC]; --no-rerun only appends to glossary.yaml
+```
+
+Confirmed terms are appended to `glossary.yaml` with `status: uncertified`
+(`decided_by: human` — never silently certified), the glossary version is bumped, and
+**only the chunks containing them** are re-queued: the confirmed pairs enter the per-chunk
+cache key through the same `emphasis` hook the M2 compliance re-queue uses.
+
+### M3 options
+
+```bash
+book-harness run <main-ocr-json> \
+  --no-drift                # skip the drift-mining stage
+  --no-artifacts            # skip appendix/bilingual/TMX/QA-report generation
+```
+
 ## Usage
 
 ```bash
@@ -225,4 +266,4 @@ python -m venv .venv && .venv/bin/pip install -e ".[tests]"
 .venv/bin/book-harness run path/to/ocr_main.json [options]
 ```
 
-Key options: `--model` (force a translation model), `--domains aerospace`, `--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after chunking).
+Key options: `--model` (force a translation model), `--domains aerospace`, `--pages LO HI` (smoke range), `--max-chunks N`, `--no-translate` (stop after chunking), `--no-drift`/`--no-artifacts` (M3 stages).

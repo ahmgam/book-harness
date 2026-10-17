@@ -222,6 +222,13 @@ class Settings:
     compliance_floor: float = COMPLIANCE_FLOOR
     refine_budget: int | None = REFINE_BUDGET
     max_spans: int = REFINE_MAX_SPANS
+    # --- M3 (artifacts + drift) ---
+    no_drift: bool = False                      # skip the glossary drift-mining stage
+    no_artifacts: bool = False                  # skip appendix/bilingual/TMX/QA report
+    appendix: bool = True
+    bilingual: bool = True
+    tmx: bool = True
+    qa_report: bool = True
 
     @property
     def book_id(self) -> str:

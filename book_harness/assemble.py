@@ -19,9 +19,11 @@ import base64
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
+from book_harness import __version__
 from book_harness.book import Block, Book, BlockType, html_to_markdown, html_to_text
 from book_harness.chunker import KIND_CAPTION, KIND_LIST_ITEM, KIND_TEXT, KIND_TITLE, Chunk
 
@@ -61,12 +63,10 @@ class DraftBook:
 
 def _apply_refinements(drafts: DraftBook, refine_dir: Path) -> int:
     """Overlay verified refined unit texts onto the drafts, siloed by chunk."""
-    from book_harness.refine import load_refinements
-
-    refinements = load_refinements(refine_dir, drafts.meta_by_chunk)
+    overrides = _refinements_cache(refine_dir, drafts.meta_by_chunk)
     applied = 0
-    for chunk_id, overrides in refinements.items():
-        for uid, text in overrides.items():
+    for chunk_id, chunk_overrides in overrides.items():
+        for uid, text in chunk_overrides.items():
             unit = drafts.unit_texts.get(f"{chunk_id}/{uid}")
             if unit is None:
                 continue
@@ -77,8 +77,17 @@ def _apply_refinements(drafts: DraftBook, refine_dir: Path) -> int:
             applied += 1
     if applied:
         logger.info("refined units applied: %d (of %s chunks)", applied,
-                    ", ".join(refinements) or 0)
+                    ", ".join(overrides) or 0)
     return applied
+
+
+def _refinements_cache(
+    refine_dir: Path, meta_by_chunk: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, str]]:
+    """Fresh refinement overrides (thin wrapper around refine.load_refinements)."""
+    from book_harness.refine import load_refinements
+
+    return load_refinements(refine_dir, meta_by_chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +178,14 @@ def render_book(
     book_id: str = "",
     refine_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Assemble ``book.md`` + ``manifest.json``; returns the manifest.
+    """Assemble ``book.md`` + ``manifest.json``; returns the manifest (M3.4).
 
-    When ``refine_dir`` is given, verified refinement results (M2) override
-    the raw draft texts for all chunks whose refinement is still fresh.
+    The manifest is the full provenance record: per chunk the translating
+    model, prompt version, glossary version, cache key, section, canonical
+    pages, unit counts and the finished/duration timestamps; book level adds
+    the pipeline version and a generation timestamp. When ``refine_dir`` is
+    given, verified refinement results (M2) override the raw draft texts and
+    are counted in the manifest.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -220,25 +233,40 @@ def render_book(
     refined_units = sum(
         1 for u in drafts.unit_texts.values() if u.get("refined")
     )
+    refined_chunks = 0
+    if refine_dir is not None:
+        refinements = _refinements_cache(
+            Path(refine_dir), drafts.meta_by_chunk
+        )
+        refined_chunks = len(refinements)
     manifest: dict[str, Any] = {
         "book_id": book_id or out_dir.parent.name,
+        "pipeline_version": __version__,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "pages": book.num_pages,
         "blocks": len(book.blocks),
         "images": len(urls),
         "chunks_total": len(chunks),
         "chunks_translated": len(drafts.meta_by_chunk),
+        "chunks_refined": refined_chunks,
         "units_translated": translated_units,
         "units_refined": refined_units,
         "chunks": [],
     }
     for chunk_id in drafts.chunk_ids():
         meta = drafts.meta_by_chunk[chunk_id]
+        chunk = next((c for c in chunks if c.chunk_id == chunk_id), None)
         manifest["chunks"].append({
             "chunk_id": chunk_id,
+            "section_title": meta.get("section") or (
+                chunk.section_path_string() if chunk else None),
+            "pages": meta.get("pages") or (chunk.pages if chunk else None),
+            "units": len(meta.get("units", [])),
             "model": meta.get("model"),
             "prompt_version": meta.get("prompt_version"),
             "glossary_version": meta.get("glossary_version"),
             "cache_key": meta.get("cache_key"),
+            "source_hash": meta.get("source_hash"),
             "finished": meta.get("finished"),
             "duration_sec": meta.get("duration_sec"),
         })

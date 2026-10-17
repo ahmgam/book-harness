@@ -24,8 +24,9 @@ from book_harness.state import RunState
 logger = logging.getLogger("book-harness")
 
 STAGES = [
-    "source", "terms", "glossary", "chunk", "gate", "translate",
-    "qe", "refine", "compliance", "consistency", "assemble",
+    "source", "outline-repair", "terms", "glossary", "chunk", "gate",
+    "translate", "qe", "refine", "compliance", "consistency", "drift",
+    "artifacts", "assemble",
 ]
 
 
@@ -413,6 +414,184 @@ def stage_assemble(settings: Settings, book: Book) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# M3 stages
+# ---------------------------------------------------------------------------
+
+def stage_outline_repair(settings: Settings, book: Book) -> dict:
+    """Re-derive heading depth from section-numbering patterns (task 3.7)."""
+    from book_harness.outline import repair_outline, repair_summary
+
+    changes = repair_outline(book)
+    summary = repair_summary(changes)
+    out = settings.stage_dir(stage="source") / "outline-repair.json"
+    out.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    if changes:
+        logger.warning(
+            "outline repair: re-levelled %d section header(s) from numbering "
+            "patterns (see %s)", len(changes), out,
+        )
+    else:
+        logger.info("outline repair: OCR heading levels are consistent")
+    return summary
+
+
+def stage_drift(settings: Settings, chunks: list) -> dict:
+    """Mine uncovered recurring terms from the drafted chunks (task 3.6)."""
+    from book_harness import drift as drift_mod
+
+    _, entries, _ = _load_glossary(settings)
+    candidates = drift_mod.mine_drift_terms(
+        [c.to_dict() for c in chunks], entries
+    )
+    out = settings.stage_dir(stage="glossary") / "drift-candidates.jsonl"
+    n = drift_mod.write_candidates(
+        candidates, out, glossary_version=_glossary_version(settings)
+    )
+    if candidates:
+        preview = ", ".join(c["term"] for c in candidates[:10])
+        logger.warning(
+            "glossary drift: %d recurring uncovered term(s) proposed for "
+            "human review -> %s (top: %s)", n, out, preview,
+        )
+    else:
+        logger.info("glossary drift: no uncovered recurring terms")
+    return {"candidates": n, "path": str(out)}
+
+
+def stage_artifacts(settings: Settings, book: Book, chunks: list) -> dict:
+    """Glossary appendix + bilingual HTML + QA report + TMX (tasks 3.1-3.5)."""
+    from book_harness.artifacts import (
+        render_bilingual_html,
+        render_glossary_appendix,
+        render_qa_report,
+        render_tmx,
+    )
+    from book_harness.assemble import DraftBook
+    from book_harness.chunker import load_chunks
+
+    run_dir = settings.run_dir()
+    _, entries, _ = _load_glossary(settings)
+    chunks = load_chunks(run_dir / config.STAGE_DIRS["chunks"])
+    drafts = DraftBook(settings.stage_dir(stage="drafts"))
+    refine_dir = run_dir / config.STAGE_DIRS["refine"]
+    out_dir = settings.stage_dir(stage="output")
+
+    summary: dict = {}
+    if settings.appendix:
+        summary["appendix"] = render_glossary_appendix(
+            entries, [c.to_dict() for c in chunks], out_dir / "glossary-appendix.md",
+            book_id=settings.book_id,
+        )
+    if settings.bilingual:
+        summary["bilingual"] = render_bilingual_html(
+            book, [c.to_dict() for c in chunks], drafts, refine_dir,
+            out_dir / "bilingual.html",
+            title=f"{settings.book_id} — bilingual edition",
+        )
+    if settings.tmx:
+        summary["tmx"] = render_tmx(
+            [c.to_dict() for c in chunks], drafts, out_dir / "book.tmx",
+            book_id=settings.book_id,
+        )
+    if settings.qa_report:
+        summary["qa_report"] = render_qa_report(
+            [c.to_dict() for c in chunks], entries, run_dir,
+            out_dir / "qa-report.md",
+            quality_threshold=settings.quality_threshold,
+            compliance_floor=settings.compliance_floor,
+        )
+    logger.info("artifacts written to %s: %s", out_dir, ", ".join(summary))
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI drift-confirm command (3.6): human step of the drift loop
+# ---------------------------------------------------------------------------
+
+def drift_confirm(
+    settings: Settings,
+    confirms: list[dict[str, str]],
+) -> dict:
+    """Append confirmed drift terms to the glossary and re-translate only the
+    chunks that contain them (cache keys change only for those chunks)."""
+    from book_harness import drift as drift_mod
+    from book_harness.chunker import load_chunks
+    from book_harness.translate import OllamaClient, SummaryTracker, translate_chunk
+
+    run_dir = settings.run_dir()
+    chunks = load_chunks(run_dir / config.STAGE_DIRS["chunks"])
+    version, entries, glossary_path = _load_glossary(settings)
+
+    entries, appended = drift_mod.append_confirmed_entries(entries, confirms)
+    if not appended:
+        logger.info("drift confirm: nothing new to append")
+        return {"appended": 0, "chunks": []}
+    glossary_mod.write_glossary(entries, glossary_path)
+    new_version = glossary_mod.glossary_version(entries)
+    logger.info(
+        "drift confirm: %d term(s) appended -> glossary version %s",
+        len(appended), new_version,
+    )
+
+    if not settings.translate:
+        logger.info(
+            "drift confirm: re-translation skipped (--no-rerun); re-run the "
+            "translate stage to apply the new terms")
+        return {"appended": len(appended), "chunks": []}
+    if not any(c.get("ar") for c in confirms):
+        logger.info(
+            "drift confirm: no Arabic forms supplied — nothing to inject into "
+            "translation; the terms are catalogued as uncertified")
+        return {"appended": len(appended), "chunks": []}
+
+    # affected chunks only: emphasis enters the per-chunk cache key so the
+    # other chunks' translated drafts stay fresh (same hook the M2 compliance
+    # re-queue uses).
+    drafts_dir = settings.stage_dir(stage="drafts")
+    client = OllamaClient(
+        host=settings.ollama_host, timeout=settings.ollama_timeout,
+        preferred=config.TRANSLATION_MODELS,
+    )
+    client.pick_model(settings.model)
+    summaries = SummaryTracker(
+        client, drafts_dir / "chapter-summary.json",
+        period=settings.summary_period,
+    )
+    enforced = [(c["en"], c["ar"]) for c in confirms if c["ar"]]
+    rerun: list[str] = []
+    for c in chunks:
+        chunk_dict = c.to_dict()
+        pairs = [
+            (en, ar) for en, ar in enforced
+            if drift_mod.affected_chunks([chunk_dict], en)
+        ]
+        if not pairs:
+            continue
+        logger.info(
+            "drift confirm: re-queuing %s (%d new terms in source)",
+            c.chunk_id, len(pairs),
+        )
+        translate_chunk(
+            c.to_dict(), client, entries, drafts_dir,
+            prompt_version=settings.prompt_version,
+            glossary_version=new_version,
+            summaries=summaries,
+            emphasis=pairs,
+        )
+        rerun.append(c.chunk_id)
+    state = RunState(run_dir)
+    state.mark(
+        "drift-confirm", status="done", terms=[e["term_en"] for e in appended],
+        rerun=rerun,
+    )
+    state.save()
+    return {"appended": len(appended), "chunks": rerun}
+
+
+
+# ---------------------------------------------------------------------------
 # Pipeline driver
 # ---------------------------------------------------------------------------
 
@@ -431,8 +610,14 @@ def run(settings: Settings) -> int:
     if not src_summary.exists():
         state.mark("source", status="started")
         stage_source(settings, book)
-        state.mark("source", status="done")
+        state.mark("source", status="done", pages=book.num_pages,
+                   blocks=len(book.blocks))
         logger.info("stage source: done")
+
+    state.mark("outline-repair", status="started")
+    outline_summary = stage_outline_repair(settings, book)
+    state.mark("outline-repair", status="done",
+               repaired=outline_summary["sections_repaired"])
 
     state.mark("terms", status="started")
     candidates = stage_terms(settings, book)
@@ -483,6 +668,18 @@ def run(settings: Settings) -> int:
     state.mark("consistency", status="started")
     stage_consistency(settings, chunks, entries)
     state.mark("consistency", status="done")
+
+    state.mark("drift", status="started")
+    if not settings.no_drift:
+        drift_summary = stage_drift(settings, chunks)
+        state.mark("drift", status="done", candidates=drift_summary["candidates"])
+    else:
+        state.mark("drift", status="done", skipped=True)
+
+    state.mark("artifacts", status="started")
+    if not settings.no_artifacts:
+        stage_artifacts(settings, book, chunks)
+    state.mark("artifacts", status="done", skipped=settings.no_artifacts)
 
     state.mark("assemble", status="started")
     stage_assemble(settings, book)
@@ -536,6 +733,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="max chunks refined per pass (None = all below threshold)")
     run_p.add_argument("--max-spans", type=int, default=config.REFINE_MAX_SPANS,
                        help="max MQM error spans per unit (default 12)")
+    run_p.add_argument("--no-drift", action="store_true",
+                       help="skip the glossary drift-mining stage (3.6)")
+    run_p.add_argument("--no-artifacts", action="store_true",
+                       help="skip appendix/bilingual/TMX/QA-report generation (3.1-3.5)")
     run_p.add_argument("--log-level", default="INFO")
 
     sub.add_parser("stages", help="show pipeline stages")
@@ -560,6 +761,28 @@ def build_parser() -> argparse.ArgumentParser:
     bake_p.add_argument("--pages", nargs=2, type=int, metavar=("LO", "HI"))
     bake_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
     bake_p.add_argument("--log-level", default="INFO")
+
+    drift_p = sub.add_parser(
+        "drift",
+        help="M3.6: glossary drift — mine recurring uncovered terms and "
+             "confirm them (append + re-run affected chunks only)",
+    )
+    drift_p.add_argument("ocr_json", type=Path, help="main OCR JSON file")
+    drift_p.add_argument("--confirm", action="append", default=[],
+                         metavar='TERM[=ARABIC]',
+                         help="confirm a proposed term, optionally with the "
+                              "human-reviewed Arabic (=ARABIC); repeatable")
+    drift_p.add_argument("--min-freq", type=int, default=3,
+                         help="min occurrences across the book")
+    drift_p.add_argument("--min-df", type=int, default=2,
+                         help="min distinct chunks the term appears in")
+    drift_p.add_argument("--no-rerun", action="store_true",
+                         help="append confirmed entries without re-translating")
+    drift_p.add_argument("--model", default=None, help="force a translation model")
+    drift_p.add_argument("--run-root", type=Path, default=Path("runs"))
+    drift_p.add_argument("--domains", nargs="+", default=list(config.DEFAULT_DOMAINS))
+    drift_p.add_argument("--ollama-host", default=config.OLLAMA_HOST)
+    drift_p.add_argument("--log-level", default="INFO")
     return p
 
 
@@ -591,7 +814,8 @@ def main(argv: list[str] | None = None) -> int:
         glossary_limit=getattr(args, "glossary_limit", None),
         max_chunks=getattr(args, "max_chunks", None),
         pages=tuple(args.pages) if getattr(args, "pages", None) else None,
-        translate=not getattr(args, "no_translate", False),
+        translate=not getattr(args, "no_translate", False)
+        and not getattr(args, "no_rerun", False),
         log_level=args.log_level,
         qe_method=getattr(args, "qe_method", "auto"),
         refine=getattr(args, "refine", True),
@@ -600,6 +824,8 @@ def main(argv: list[str] | None = None) -> int:
         compliance_floor=getattr(args, "compliance_floor", config.COMPLIANCE_FLOOR),
         refine_budget=getattr(args, "refine_budget", config.REFINE_BUDGET),
         max_spans=getattr(args, "max_spans", config.REFINE_MAX_SPANS),
+        no_drift=getattr(args, "no_drift", False),
+        no_artifacts=getattr(args, "no_artifacts", False),
     )
     try:
         if args.command == "bakeoff":
@@ -610,6 +836,37 @@ def main(argv: list[str] | None = None) -> int:
                 judge_model=args.judge,
             )
             logger.info("bake-off report: %s", report)
+            return 0
+        if args.command == "drift":
+            from book_harness import drift as drift_mod
+            from book_harness.chunker import load_chunks
+
+            run_dir = settings.run_dir()
+            if getattr(args, "confirm", None):
+                confirms = drift_mod.parse_confirm_args(args.confirm)
+                result = drift_confirm(settings, confirms)
+                logger.info("drift confirm result: %s", result)
+                return 0
+            # mining: propose recurring uncovered terms from existing chunks
+            chunks = load_chunks(run_dir / config.STAGE_DIRS["chunks"])
+            _, entries, _ = _load_glossary(settings)
+            candidates = drift_mod.mine_drift_terms(
+                [c.to_dict() for c in chunks], entries,
+                min_freq=args.min_freq, min_df=args.min_df,
+            )
+            out = settings.stage_dir(stage="glossary") / "drift-candidates.jsonl"
+            drift_mod.write_candidates(
+                candidates, out, glossary_version=_glossary_version(settings)
+            )
+            for c in candidates:
+                logger.info(
+                    "drift candidate: %s (freq %d, chunks %d, page %s)",
+                    c["term"], c["freq"], c["df"], c.get("page"),
+                )
+            logger.info(
+                "%d proposed terms -> %s (confirm with `drift --confirm TERM=AR`)",
+                len(candidates), out,
+            )
             return 0
         return run(settings)
     except ConnectionError as e:
