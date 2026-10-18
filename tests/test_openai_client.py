@@ -17,6 +17,7 @@ from book_harness.translate import (
     build_client,
     is_openai_base,
     model_matches,
+    _canonical_name,
 )
 
 FINISHED = {
@@ -149,3 +150,24 @@ def test_model_matches_org_and_tag_shapes():
     assert model_matches(["unsloth/Llama-4B-Instruct"], "llama-4b-instruct")
     assert model_matches(["qwen2.5:14b-instruct"], "qwen2.5:14b-instruct")
     assert not model_matches(installed, "hy-mt2-30b-a3b")
+
+
+def test_canonical_name_resolves_matched_shapes():
+    # regression: model_matches accepts bare-name matches against hub-prefixed
+    # and tag-suffixed ids, so _canonical_name must resolve those to the real
+    # installed name (otherwise /api/generate 404s with the unqualified name)
+    installed = [
+        "melashri/hy-mt2-30b-a3b:q4_k_m",
+        "unsloth/Llama-4B-Instruct",
+        "llama3.1:8b",
+    ]
+    assert _canonical_name(installed, "hy-mt2-30b-a3b") == (
+        "melashri/hy-mt2-30b-a3b:q4_k_m"
+    )
+    assert _canonical_name(installed, "llama-4b-instruct") == (
+        "unsloth/Llama-4B-Instruct"
+    )
+    # exact install-name wins over a hub-prefixed variant
+    assert _canonical_name(installed, "llama3.1:8b") == "llama3.1:8b"
+    # no match -> name unchanged (callers check model_matches first)
+    assert _canonical_name(installed, "qwen2.5:14b") == "qwen2.5:14b"

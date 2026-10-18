@@ -11,6 +11,7 @@ from book_harness.artifacts import (
     render_glossary_appendix,
     render_qa_report,
     render_tmx,
+    render_translated_html,
 )
 from book_harness.book import Block, BlockType, Book, PageInfo
 from book_harness.chunker import Chunk
@@ -374,6 +375,7 @@ class TestTMX:
         props = {p.get("type"): p.text for p in first.findall("prop")}
         assert props["chunk"] == "chunk-0001"
         assert props["section"] == "1 Design > 1.1 Overview"
+        assert props["page"] == "1"
         tuvs = first.findall("tuv")
         assert tuvs[0].get("{http://www.w3.org/XML/1998/namespace}lang") == "en"
         assert tuvs[0].find("seg").text == "The lift increases with angle."
@@ -397,3 +399,134 @@ class TestTMX:
         draft["units"] = DRAFT["units"][:1]
         summary = render_tmx([_chunk()], _fake_drafts(draft), out)
         assert summary["translation_units"] == 1
+
+    def _figure_book(self):
+        from book_harness.book import Block, BlockType, Book, PageInfo
+
+        fig = Block(
+            id="/page/1/FigureGroup/0", type=BlockType.FIGURE_GROUP,
+            html="<img src='figimg'>", page=1,
+            bbox=(0, 0, 0, 0), polygon=[], section_hierarchy={},
+            images={"figimg": "Zm9v"},
+        )
+        page = PageInfo(index=1, width=600, height=800,
+                        bbox=(0, 0, 600, 800), polygon=[])
+        return Book(blocks=[fig], pages={1: page}, toc=[], page_stats=[])
+
+    def test_passthrough_blocks_interleaved(self, tmp_path):
+        chunk = json.loads(json.dumps(CHUNK_DICT))
+        chunk["blocks"].insert(
+            1, {"block_id": "/page/1/FigureGroup/0", "page": 1,
+                "type": "FigureGroup", "units": []})
+        out = tmp_path / "book.tmx"
+        summary = render_tmx(
+            [chunk], _fake_drafts(DRAFT), out, book_id="tb",
+            book=self._figure_book(),
+        )
+        tree = ET.parse(out)
+        tus = tree.getroot().find("body").findall("tu")
+        # two translated units + one passthrough figure, in reading order:
+        # u0, figure, u1
+        assert len(tus) == 3
+        assert "images/p001_figimg.jpg" in out.read_text(encoding="utf-8")
+        assert (tmp_path / "images" / "p001_figimg.jpg").exists()
+        passthrough = tus[1]
+        props = {p.get("type"): p.text for p in passthrough.findall("prop")}
+        assert props["kind"] == "passthrough"
+        assert props["blocktype"] == "FigureGroup"
+        assert props["page"] == "1"
+        assert passthrough.find("tuv[@dir='rtl']/seg").text == (
+            "<img src='images/p001_figimg.jpg'>"
+        )
+        assert summary["translation_units"] == 3
+
+
+class TestTranslatedHTML:
+    """Page-divided print edition rendered from the TMX alone (print cmd)."""
+
+    def _write_tmx(self, tmp_path: Path) -> Path:
+        tmx = tmp_path / "book.tmx"
+        chunk2 = json.loads(json.dumps(CHUNK_DICT))
+        chunk2["chunk_id"] = "chunk-0002"
+        chunk2["pages"] = [2]
+        for b in chunk2["blocks"]:
+            b["page"] = 2
+            b["block_id"] = b["block_id"].replace("/page/1/", "/page/2/")
+        draft2 = dict(DRAFT, chunk_id="chunk-0002")
+        drafts = DraftBook.__new__(DraftBook)
+        drafts.meta_by_chunk = {DRAFT["chunk_id"]: DRAFT, "chunk-0002": draft2}
+        drafts.unit_texts = {}
+        for d in (DRAFT, draft2):
+            for u in d["units"]:
+                drafts.unit_texts[f"{d['chunk_id']}/{u['uid']}"] = dict(u)
+        render_tmx([_chunk(), chunk2], drafts, tmx, book_id="test-book")
+        return tmx
+
+    def test_pages_and_print_css(self, tmp_path):
+        tmx = self._write_tmx(tmp_path)
+        out = tmp_path / "translated.html"
+        summary = render_translated_html(tmx, out)
+        html = out.read_text(encoding="utf-8")
+        assert summary["pages"] == 2 and summary["units"] == 4
+        # one section per book page, RTL Arabic document
+        assert '<html lang="ar" dir="rtl">' in html
+        assert 'id="page-1"' in html and 'id="page-2"' in html
+        assert ">page 1</span>" in html and ">page 2</span>" in html
+        # print CSS: A4 sheet + a forced break after each book page
+        assert "@page" in html and "size:A4" in html
+        assert "page-break-after:always" in html and "break-after:page" in html
+        # translated text lands in the right page section
+        assert "الرفع يزداد مع الزاوية." in html and "التصميم" in html
+        # section headings repeat inside pages (from the section prop)
+        assert "<h2>1 &gt; Design &gt; 1.1 Overview</h2>" in html
+
+    def test_title_defaults_to_book_prop(self, tmp_path):
+        tmx = self._write_tmx(tmp_path)
+        out = tmp_path / "translated.html"
+        render_translated_html(tmx, out)
+        html = out.read_text(encoding="utf-8")
+        assert "<title>test-book</title>" in html and "<h1>test-book</h1>" in html
+
+    def test_tmx_without_page_props_falls_back(self, tmp_path):
+        tmx = tmp_path / "legacy.tmx"
+        tmx.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<tmx version="1.4"><header srclang="en"/>'
+            '<body><tu tuid="t1">'
+            '<tuv xml:lang="ar" dir="rtl"><seg>نص مترجم</seg></tuv>'
+            "</tu></body></tmx>", encoding="utf-8")
+        out = tmp_path / "translated.html"
+        summary = render_translated_html(tmx, out, title="T")
+        html = out.read_text(encoding="utf-8")
+        assert summary["pages"] == 1 and 'id="page-x"' in html
+        assert "(unnumbered)" in html and "نص مترجم" in html
+
+    def test_passthrough_images_embedded(self, tmp_path):
+        # TMX carrying a passthrough block -> raw HTML + image in print HTML
+        tmx = tmp_path / "book.tmx"
+        tmx.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<tmx version="1.4"><header srclang="en"/>'
+            '<body>'
+            '<tu tuid="t1">'
+            '<prop type="kind">passthrough</prop>'
+            '<prop type="blocktype">FigureGroup</prop>'
+            '<prop type="page">7</prop>'
+            '<tuv xml:lang="ar" dir="rtl">'
+            "<seg>&lt;img src='images/p007_fig.jpg'&gt;</seg></tuv>"
+            "</tu>"
+            '<tu tuid="t2">'
+            '<prop type="kind">title</prop><prop type="page">7</prop>'
+            '<tuv xml:lang="ar" dir="rtl"><seg>الشكل 1.2</seg></tuv>'
+            "</tu>"
+            "</body></tmx>", encoding="utf-8")
+        out = tmp_path / "translated.html"
+        summary = render_translated_html(tmx, out, title="T")
+        html = out.read_text(encoding="utf-8")
+        assert summary["units"] == 2
+        # passthrough renders raw, unescaped, inside .full
+        assert "<div class='full'>" not in html
+        assert '<img src=\'images/p007_fig.jpg\'>' in html
+        assert 'class="full"' in html
+        # kind styling honored for translated text
+        assert '<p class="title">الشكل 1.2</p>' in html

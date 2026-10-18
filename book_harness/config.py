@@ -24,6 +24,8 @@ STAGE_DIRS = {
     "refine": "05_refine",
     "qa": "06_qa",
     "output": "07_output",
+    "format": "08_format",          # M5: per-page formatting artifacts
+    "format_qa": "09_qa",           # M5: format-report.jsonl
 }
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,8 @@ TARGET = "ar"
 #:                  chapter summaries
 #: ``qe``           QE LLM-judge scoring + bake-off judge (``--judge``
 #:                  still overrides)
+#: ``format``       M5 per-page AI formatting (layout-only rewrite);
+#:                  general instruct models, NEVER the MT model
 #: ================ ====================================================
 #:
 #: Each role resolves its own preference list: the first entry installed on
@@ -61,6 +65,7 @@ TARGET = "ar"
 #: * ``BOOK_HARNESS_TRANSLATION_MODELS`` / ``BOOK_HARNESS_TRANSLATION_MODEL``
 #: * ``BOOK_HARNESS_ASSIST_MODELS`` / ``BOOK_HARNESS_ASSIST_MODEL``
 #: * ``BOOK_HARNESS_QE_MODELS`` / ``BOOK_HARNESS_QE_MODEL``
+#: * ``BOOK_HARNESS_FORMAT_MODELS`` / ``BOOK_HARNESS_FORMAT_MODEL``
 #:
 #: Values: whitespace- or comma-separated Ollama names / server model IDs,
 #: e.g. ``BOOK_HARNESS_TRANSLATION_MODELS="hy-mt2-30b-a3b, qwen2.5:14b"``.
@@ -86,6 +91,22 @@ ASSIST_MODELS = _env_models(
     TRANSLATION_MODELS,
 )
 QE_MODELS = _env_models("BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", ASSIST_MODELS)
+
+#: M5 formatting role (task 5.6): general instruct models by preference,
+#: with small generic instructs as fallback. Deliberately does NOT inherit
+#: the translation list — a dedicated MT model should never be reused for
+#: the layout-writing pass.
+_FORMAT_MODEL_DEFAULTS = [
+    "qwen3.8",                      # 27B general instruct
+    "gemma4",                       # 26B general instruct
+    "k2-horizon",                   # 36B general instruct
+    "qwen2.5:14b", "llama3.1:8b",   # generic instruct fallbacks
+]
+FORMAT_MODELS = _env_models(
+    "BOOK_HARNESS_FORMAT_MODELS",
+    "BOOK_HARNESS_FORMAT_MODEL",
+    _FORMAT_MODEL_DEFAULTS,
+)
 
 #: Default serving backend is Ollama (native ``/api/generate``). A host URL
 #: ending in ``/v1`` auto-selects the OpenAI-compatible chat-completions API
@@ -151,9 +172,7 @@ QE_METHOD_DEFAULT = "auto"
 
 #: Chunks below this compliance rate (%) are re-queued for targeted
 #: re-translation (2.4).
-COMPLIANCE_FLOOR = 95.0
-
-#: Hard cap on the number of chunks refined in one pass (None = budgetless;
+COMPLIANCE_FLOOR = 95.0#: Hard cap on the number of chunks refined in one pass (None = budgetless;
 #: worst-scoring chunks go first either way).
 REFINE_BUDGET: int | None = None
 
@@ -170,6 +189,112 @@ MQM_CATEGORIES = (
     "style",
     "punctuation",
 )
+
+# ---------------------------------------------------------------------------
+# AI page formatting (M5: tasks 5.2 / PLAN.md milestone 5)
+# ---------------------------------------------------------------------------
+
+#: Bump to invalidate the per-page format cache (independent of the
+#: translation PROMPT_VERSION).
+FORMAT_PROMPT_VERSION = "fmt-v2"
+
+#: Base instruction card (system prompt) shared by every archetype. The
+#: archetype-specific card from PAGE_FORMAT_ARCHETYPES is appended in the
+#: user message. See PLAN.md M5 "Instruction cards".
+PAGE_FORMAT_SYSTEM = (
+    "You are a markdown layout formatter for an Arabic RTL technical book.\n"
+    "You receive ONE page of the book. Fix only its layout and structure.\n"
+    "Rules:\n"
+    "1. Never reword, translate, summarize, reorder blocks, or add content. "
+    "Every word must survive: the output is verified against the input on a "
+    "whitespace-insensitive basis and violations are discarded.\n"
+    "2. Never touch: placeholder tokens (§EQ0§, §URL0§, §CIT0§, …), image "
+    "markdown ![…](images/…), numeric content, or anything inside fenced "
+    "code blocks.\n"
+    "3. When nearly every line is a distinct short entry (bibliography, "
+    "reference list, credits, author lists, revision history), keep one "
+    "entry per line: never merge entries into paragraphs.\n"
+    "4. A paragraph is one line. Exactly one blank line separates blocks. "
+    "Headings use ATX form (#). One space after sentence punctuation.\n"
+    "5. The only structural changes allowed: heading levels, --- separators, "
+    "bullet/ordered markers and their indentation, > callouts, and "
+    "bold/italic emphasis that mirrors emphasis in the source.\n"
+    "6. Output only the formatted page markdown — no notes, no fences "
+    "around the whole page, no explanations."
+)
+
+#: One instruction card per page archetype (task 5.1's classifier output).
+PAGE_FORMAT_ARCHETYPES: dict[str, str] = {
+    "narrative": (
+        "Page archetype: narrative body text.\n"
+        "- Join hyphen-broken and soft-wrapped lines into single-line "
+        "paragraphs.\n"
+        "- Collapse runs of newlines to exactly one blank line.\n"
+        "- Drop a leaked repeated running header/footer (the same line "
+        "repeating across neighboring pages).\n"
+        "- Never merge a paragraph into a following heading or list item."
+    ),
+    "list": (
+        "Page archetype: lists. Reconstruct list structure the OCR lost.\n"
+        "- Lines beginning with 1. / ١. / a) / أ) / - / • / * inside body "
+        "text are list items: re-emit them as markdown list items. Keep "
+        "Arabic marker text as written (e.g. '1.' in Arabic RTL order).\n"
+        "- Renumber only consecutive ordered sequences.\n"
+        "- Nested items: 2-space indent per level, maximum 3 levels.\n"
+        "- Never merge two items; never split an item across a blank line."
+    ),
+    "table": (
+        "Page archetype: tables.\n"
+        "- Pipe tables: one row per line, uniform column count (escape "
+        "stray | with \\|), regenerate the separator row, drop empty OCR "
+        "column stubs. Cell text never wraps across lines.\n"
+        "- HTML passthrough tables: leave the structure exactly as-is."
+    ),
+    "figure": (
+        "Page archetype: figures/pictures.\n"
+        "- Image lines ![…](…) stand alone: no text glued to them.\n"
+        "- Captions: a single italic line directly after their image.\n"
+        "- Strip scan artifacts (stray | or stray quote glyphs)."
+    ),
+    "equation": (
+        "Page archetype: equations.\n"
+        "- Never edit, reorder, or split placeholder/equation tokens or "
+        "equation references; only clean the surrounding narrative spacing."
+    ),
+    "code": (
+        "Page archetype: code.\n"
+        "- Wrap stray code fragments in fenced blocks with a best-guess "
+        "language tag; inline code in backticks.\n"
+        "- Preserve spacing inside fences EXACTLY (no unwrapping)."
+    ),
+    "toc": (
+        "Page archetype: table of contents.\n"
+        "- One entry per line, page numbers verbatim.\n"
+        "- Consistent indentation per level; leader dots (……) normalized "
+        "to a single '… N' suffix; the whole page as one consistent list.\n"
+        "- Original order preserved; never sort."
+    ),
+    "footnote": (
+        "Page archetype: footnotes.\n"
+        "- Definitions: [^n]: text, one per line; inline markers [^n].\n"
+        "- Never merge footnotes with body text."
+    ),
+    "front_matter": (
+        "Page archetype: front matter (cover/title/edition).\n"
+        "- Title as a heading level; subtitle/author/edition lines kept "
+        "separate.\n"
+        "- Strip page-number and printer noise; preserve line emphasis."
+    ),
+    "index": (
+        "Page archetype: index.\n"
+        "- One entry per line; keep the 'term, sub-entry, number' pattern "
+        "and commas.\n"
+        "- Original order preserved; never sort."
+    ),
+    "default": (
+        "Page archetype: mixed. Apply only the base rules; light cleanup."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +408,12 @@ class Settings:
     appendix: bool = True
     bilingual: bool = True
     tmx: bool = True
+    translated_html: bool = True                # page-divided print edition (from TMX)
     qa_report: bool = True
+    # --- M5 (AI formatting pass) ---
+    no_format: bool = False
+    force_format: bool = False
+    format_pages: tuple[int, int] | None = None
 
     @property
     def book_id(self) -> str:

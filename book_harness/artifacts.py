@@ -15,6 +15,10 @@ to a model, so they are cheap, idempotent and re-runnable at any time:
   uncertified terms used in each chapter, plus book-level totals.
 * **TMX export (3.5)** — ``07_output/book.tmx``:
   TMX 1.4 translation memory of the aligned source/translation pairs.
+* **Translated print edition** — ``07_output/translated.html``:
+  RTL Arabic-only, page-divided HTML rendered *from the TMX*; sections map
+  1:1 to book pages with print CSS (``@page`` + ``break-after: page``) so
+  printing splits correctly.
 
 The provenance manifest (3.4) is written by :func:`render_book` in
 ``assemble.py`` — every chunk already carries model, prompt version, glossary
@@ -248,9 +252,10 @@ def render_bilingual_html(
     return {**stats, "path": str(out_path)}
 
 
-def _restore(unit: dict[str, Any]) -> str:
-    """Source text with placeholder tokens substituted back."""
-    text = unit.get("text", "")
+def _restore(unit: dict[str, Any], text: str | None = None) -> str:
+    """Text with placeholder tokens substituted back; defaults to the source
+    text, pass *text* to restore a translated variant (draft target)."""
+    text = unit.get("text", "") if text is None else text
     placeholders = unit.get("placeholders") or {}
     if not placeholders:
         return text
@@ -259,6 +264,15 @@ def _restore(unit: dict[str, Any]) -> str:
         return placeholders.get(m.group(0), m.group(0))
 
     return _TOKEN_RE.sub(sub, text)
+
+
+def _rewire_images(html: str, urls: dict[str, str]) -> str:
+    """Rewrite ``src='…'`` attributes in block HTML to extracted file paths."""
+    return re.sub(
+        r"src='([^']+)'",
+        lambda m: "src='%s'" % urls.get(m.group(1), m.group(1)),
+        html,
+    )
 
 
 def _unit_row(unit: dict[str, Any], src: str, tgt: str | None) -> str:
@@ -459,7 +473,160 @@ def _write_report_md(
 
 
 # ---------------------------------------------------------------------------
-# 3.5 TMX export
+# 3.5 Translated print edition (stands alone on the TMX)
+# ---------------------------------------------------------------------------
+
+_PRINT_CSS = """\
+@page{size:A4;margin:18mm 16mm 20mm;@bottom-center{content:"— " counter(page) " —";font-size:.75rem;color:#888}}
+html{font-size:12pt}
+body{margin:0;background:#fff;color:#111;direction:rtl;text-align:right;
+  font-family:'Noto Naskh Arabic','Amiri','Scheherazade New','Traditional Arabic','Tahoma',serif;
+  line-height:1.75}
+h1{font-size:1.5rem;text-align:center;margin:0 0 1.5rem}
+h2{font-size:1.05rem;color:#333;border-bottom:1px solid #ddd;padding-bottom:.2rem;margin:1.2rem 0 .6rem}
+h3{font-size:.95rem;color:#444;margin:.9rem 0 .3rem}
+p{margin:.35rem 0;text-align:justify;hyphens:none}
+p.title{font-weight:700;font-size:1.05rem}
+p.caption{font-size:.92rem;color:#555;text-align:center}
+.full{margin:.6rem 0;page-break-inside:avoid;break-inside:avoid-page}
+.full img{max-width:100%;height:auto;display:block;margin:.5rem auto}
+.full .passtype{float:left;color:#a09890;font-size:.68rem;font-weight:400;
+  text-transform:inherit;letter-spacing:0}
+.full .figmark{clear:both;color:#a09890;text-align:left;font-size:.68rem}
+.full table{border-collapse:collapse;width:100%}
+.full td,.full th{border:1px solid #999;padding:4px 8px}
+.full .list{margin:.3rem 0;padding-inline-start:1.4rem}
+.full math{font-size:1.05em}
+.full pre,.full code{direction:ltr;text-align:left;font-family:monospace;font-size:.85rem;
+  background:#f4f4f4;padding:.3rem .5rem;border-radius:4px;unicode-bidi:embed}
+.page{page-break-after:always;break-after:page;page-break-inside:avoid;break-inside:avoid-page}
+.page:last-of-type{page-break-after:auto;break-after:auto}
+.page header{display:flex;justify-content:space-between;align-items:baseline;
+  border-bottom:2px solid #999;padding-bottom:.2rem;margin-bottom:.6rem;
+  font-size:.72rem;color:#888;text-transform:uppercase;letter-spacing:.08em}
+@media screen{
+  body{background:#525659}
+  .page{background:#fff;margin:1.2rem auto;max-width:38rem;padding:1.4rem 1.8rem;
+    border-radius:6px;box-shadow:0 1px 8px rgba(0,0,0,.35)}
+}
+@media print{
+  body{background:#fff}
+  .page{padding:0;max-width:none;margin:0}
+}
+"""
+
+
+def render_translated_html(
+    tmx_path: str | Path,
+    out_path: str | Path,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Page-divided, print-ready HTML of the translated book from a TMX.
+
+    Reads ``07_output/book.tmx`` (each ``<tu>`` carries its book page in a
+    ``<prop type="page">``), groups translated units by page and emits RTL
+    Arabic sections that each map to one printed page: ``@page`` size/margins
+    and ``break-after: page`` per section, so printing the page from a browser
+    reproduces the book's pagination.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(tmx_path).getroot()
+    if title is None:
+        prop = root.find("header/prop[@type='book']")
+        title = (prop.text if prop is not None and prop.text
+                 else "Translated edition")
+
+    units: list[dict[str, Any]] = []
+    last_page: int | None = None
+    for tu in root.iter("tu"):
+        props = {pr.get("type"): (pr.text or "") for pr in tu.findall("prop")}
+        if props.get("page"):
+            try:
+                last_page = int(props["page"])
+            except ValueError:
+                pass
+        seg = None
+        for tuv in tu.findall("tuv"):
+            lang = tuv.get("{http://www.w3.org/XML/1998/namespace}lang") or ""
+            if lang.lower().startswith("ar"):
+                seg = tuv.find("seg")
+                break
+        text = "".join(seg.itertext()) if seg is not None else None
+        if not (text or "").strip():
+            continue
+        units.append({
+            "page": last_page,
+            "section": props.get("section") or "",
+            "kind": (props.get("kind") or "text").lower(),
+            "blocktype": props.get("blocktype") or "",
+            "chunk": props.get("chunk") or "",
+            "text": text,
+        })
+
+    # group by page; TMX without page props lands in one "(unnumbered)" bucket
+    buckets: dict[Any, list[dict[str, Any]]] = {}
+    order: list[Any] = []
+    for u in units:
+        key = u["page"] if u["page"] is not None else None
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(u)
+
+    numbered = [(p, buckets[p]) for p in sorted(o for o in order if o is not None)]
+    unnumbered = [(None, buckets[p]) for p in order if p is None]
+    page_groups = numbered + unnumbered
+
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="ar" dir="rtl"><head><meta charset="utf-8">',
+        f"<title>{_xml.escape(title)}</title>",
+        f"<style>{_PRINT_CSS}</style></head><body>",
+        f"<h1>{_xml.escape(title)}</h1>",
+    ]
+    total = len(page_groups)
+    for pos, (page, group) in enumerate(page_groups, 1):
+        label = f"page {page}" if page is not None else "(unnumbered)"
+        parts.append(
+            f'<section class="page" id="page-{page if page is not None else "x"}">'
+            f"<header><span>{_xml.escape(label)}</span>"
+            f"<span>{pos} / {total}</span></header>"
+        )
+        last_section: str | None = None
+        for u in group:
+            if u["section"] and u["section"] != last_section:
+                last_section = u["section"]
+                parts.append(f"<h2>{_xml.escape(u['section'])}</h2>")
+            if u["kind"] == "passthrough":
+                html = (u["text"] or "").rstrip()
+                if "figure" in u["blocktype"].lower():
+                    html += ('<div class="figmark">'
+                             + _xml.escape(u["blocktype"]) + "</div>")
+                parts.append(f'<div class="full">{html}</div>')
+            elif u["kind"] == "title":
+                parts.append(f'<p class="title">{_xml.escape(u["text"])}</p>')
+            elif u["kind"] == "caption":
+                parts.append(f'<p class="caption">{_xml.escape(u["text"])}</p>')
+            else:
+                parts.append(f"<p>{_xml.escape(u['text'])}</p>")
+        parts.append("</section>")
+    parts += ["</body></html>"]
+    html = "\n".join(parts)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+    logger.info(
+        "translated print edition: %d pages, %d units -> %s",
+        total, len(units), out_path,
+    )
+    return {"pages": total, "units": len(units), "path": str(out_path)}
+
+
+# ---------------------------------------------------------------------------
+# 3.6 TMX export
 # ---------------------------------------------------------------------------
 
 def render_tmx(
@@ -478,22 +645,105 @@ def render_tmx(
     """
     from book_harness import __version__
 
+def render_tmx(
+    chunks: list[dict[str, Any]],
+    drafts: Any,                             # assemble.DraftBook
+    out_path: str | Path,
+    *,
+    source_lang: str = "en",
+    target_lang: str = "ar",
+    book_id: str = "",
+    book: Any | None = None,                 # Book, to embed passthrough blocks
+) -> dict[str, Any]:
+    """TMX 1.4 translation memory of aligned chunk pairs (task 3.5).
+
+    One ``<tu>`` per translated unit (source/translation), section, page and
+    chunk recorded as ``<prop>``; draft-missing units are skipped, not
+    invented.  When *book* is given the non-translatable passthrough blocks
+    (figures, pictures, tables, equations, code) are interleaved in reading
+    order as ``kind="passthrough"`` units carrying their rendered HTML —
+    image ``src`` attributes are rewritten to ``images/…`` copies written next
+    to the TMX — so the print edition can render the full layout from the TMX
+    alone.  Target placeholders are restored with the unit's placeholder map
+    so inline equations/links survive into the TMX too.
+    """
+    from book_harness import __version__
+    from book_harness.assemble import extract_images
+
+    out_dir = Path(out_path).parent
+    urls: dict[str, str] = {}
+    if book is not None:
+        urls = extract_images(book, out_dir / "images")
+
     chunks = chunk_dicts(chunks)
-    pairs: list[dict[str, str]] = []
+    pairs: list[dict[str, Any]] = []
     for chunk in chunks:
-        for unit in chunk.get("units", []):
-            if unit.get("kind") not in TRANSLATED_KINDS:
-                continue
-            d = drafts.unit(chunk["chunk_id"], unit["uid"]) if drafts else None
+        ref_by_uid: dict[str, dict[str, Any]] = {}
+        for ref in chunk.get("blocks", []):
+            for uid in ref.get("units", []):
+                ref_by_uid[uid] = ref
+
+        def _page(ref: dict[str, Any] | None) -> int | None:
+            page = ref.get("page") if ref else None
+            if page is None:
+                page = (chunk.get("pages") or [None])[0]
+            return int(page) if page is not None else None
+
+        def _section() -> str:
+            return chunk.get("section_title", "")
+
+        seen_units: set[str] = set()
+
+        def _unit(uid: str, ref: dict[str, Any] | None) -> None:
+            if uid in seen_units:
+                return
+            seen_units.add(uid)
+            unit = dict_units.get(uid)
+            if not unit or unit.get("kind") not in TRANSLATED_KINDS:
+                return
+            d = drafts.unit(chunk["chunk_id"], uid) if drafts else None
             if not d or not (d.get("text") or "").strip():
-                continue
+                return
             pairs.append({
+                "kind": unit.get("kind", "text"),
                 "chunk_id": chunk["chunk_id"],
-                "section": chunk.get("section_title", ""),
-                "uid": unit["uid"],
+                "section": _section(),
+                "uid": uid,
+                "page": _page(ref),
                 "src": _restore(unit),
-                "tgt": d["text"],
+                "tgt": _restore(unit, d["text"]),
             })
+
+        dict_units: dict[str, dict[str, Any]] = {}
+        for unit in chunk.get("units", []):
+            dict_units.setdefault(unit.get("uid", ""), unit)
+
+        # reading order: block refs first, passthrough blocks in between;
+        # units not attached to any block ref are appended afterwards
+        if book is not None:
+            for ref in chunk.get("blocks", []):
+                if not ref.get("units"):
+                    block = book.block(ref["block_id"])
+                    if block is None:
+                        continue
+                    pairs.append({
+                        "kind": "passthrough",
+                        "blocktype": block.type.value,
+                        "chunk_id": chunk["chunk_id"],
+                        "section": _section(),
+                        "uid": ref["block_id"].lstrip("/"),
+                        "page": _page(ref),
+                        "src": "",
+                        "tgt": _rewire_images(block.html, urls),
+                    })
+                for uid in ref.get("units", []):
+                    _unit(uid, ref)
+        else:
+            for unit in chunk.get("units", []):
+                _unit(unit.get("uid", ""), ref_by_uid.get(unit.get("uid", "")))
+        for uid in dict_units:
+            _unit(uid, ref_by_uid.get(uid))
+
 
     lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
@@ -510,8 +760,15 @@ def render_tmx(
         block = [
             f'    <tu tuid="{tuid}">',
         ]
+        block.append(f'      <prop type="kind">{_xml.escape(p["kind"])}</prop>')
+        if p.get("blocktype"):
+            block.append(
+                f'      <prop type="blocktype">{_xml.escape(p["blocktype"])}</prop>'
+            )
         if p["section"]:
             block.append(f'      <prop type="section">{_xml.escape(p["section"])}</prop>')
+        if p["page"] is not None:
+            block.append(f'      <prop type="page">{p["page"]}</prop>')
         block.append(f'      <prop type="chunk">{_xml.escape(p["chunk_id"])}</prop>')
         block.append(
             f'      <tuv xml:lang="{_xml.escape(source_lang)}">'

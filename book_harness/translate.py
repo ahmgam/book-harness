@@ -133,10 +133,19 @@ def model_matches(installed: list[str], want: str) -> bool:
 
 
 def _canonical_name(installed: list[str], want: str) -> str:
+    """Resolve ``want`` to the *actually installed* model name.
+
+    Must agree with :func:`model_matches`: whatever that matcher accepts has
+    to be resolvable here, otherwise the client keeps the bare/unqualified
+    name and the server rejects it at generation time (HTTP 404).
+    """
     want = (want or "").lower()
+    # exact (full id or tag-suffixed) names win over loose matches
     for name in installed:
-        n = name.lower()
-        if n == want or n.startswith(want + ":") or n == want + ":latest":
+        if name.lower() in (want, want + ":latest"):
+            return name
+    for name in installed:
+        if model_matches([name], want):
             return name
     return want
 
@@ -164,7 +173,9 @@ def _pick_model_installed(
     for cand in client.preferred:
         if model_matches(installed, cand):
             client.model = _canonical_name(installed, cand)
-            logger.info("translation model: %s", client.model)
+            logger.info("model (%s): %s",
+                        ",".join(client.preferred[:2]) or "unspecified",
+                        client.model)
             return client.model
     client.model = installed[0]
     logger.warning(

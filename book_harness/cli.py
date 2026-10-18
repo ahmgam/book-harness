@@ -27,7 +27,7 @@ logger = logging.getLogger("book-harness")
 STAGES = [
     "source", "outline-repair", "terms", "glossary", "chunk", "gate",
     "translate", "qe", "refine", "compliance", "consistency", "drift",
-    "artifacts", "assemble",
+    "artifacts", "assemble", "format",
 ]
 
 
@@ -166,6 +166,21 @@ def _assist_client(settings: Settings, preferred: list[str] | None = None) -> An
         api=settings.api,
         api_key=settings.api_key,
         model=settings.model,          # explicit model also steers QA roles
+    )
+
+
+def _format_client(settings: Settings, model_override: str | None = None) -> Any:
+    """M5 formatting role: general instruct preference list (``config.
+    FORMAT_MODELS``), never the dedicated MT model."""
+    from book_harness.translate import build_client
+
+    return build_client(
+        settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        preferred=config.FORMAT_MODELS,
+        api=settings.api,
+        api_key=settings.api_key,
+        model=model_override,
     )
 
 
@@ -483,6 +498,7 @@ def stage_artifacts(settings: Settings, book: Book, chunks: list) -> dict:
         render_bilingual_html,
         render_glossary_appendix,
         render_qa_report,
+        render_translated_html,
         render_tmx,
     )
     from book_harness.assemble import DraftBook
@@ -510,8 +526,13 @@ def stage_artifacts(settings: Settings, book: Book, chunks: list) -> dict:
     if settings.tmx:
         summary["tmx"] = render_tmx(
             [c.to_dict() for c in chunks], drafts, out_dir / "book.tmx",
-            book_id=settings.book_id,
+            book_id=settings.book_id, book=book,
         )
+        if settings.translated_html:
+            summary["translated_html"] = render_translated_html(
+                out_dir / "book.tmx", out_dir / "translated.html",
+                title=f"{settings.book_id} — الطبعة العربية",
+            )
     if settings.qa_report:
         summary["qa_report"] = render_qa_report(
             [c.to_dict() for c in chunks], entries, run_dir,
@@ -611,6 +632,32 @@ def drift_confirm(
 
 
 # ---------------------------------------------------------------------------
+# M5 stage
+# ---------------------------------------------------------------------------
+
+def stage_format(settings: Settings, book: Book) -> dict:
+    """AI formatting pass, archetype card per page (task 5.4 / M5)."""
+    from book_harness.format import format_book
+    from book_harness.pages import classify_book
+
+    book_md_path = settings.stage_dir(stage="output") / "book.md"
+    book_md = book_md_path.read_text(encoding="utf-8")
+    client = _format_client(settings)
+    summary, _report = format_book(
+        book_md,
+        classify_book(book),
+        client=client,
+        model=str(getattr(client, "model", "") or ""),
+        out_path=book_md_path,
+        format_dir=settings.stage_dir(stage="format"),
+        report_path=settings.stage_dir(stage="format_qa") / "format-report.jsonl",
+        force=settings.force_format,
+        pages_limit=settings.format_pages,
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Pipeline driver
 # ---------------------------------------------------------------------------
 
@@ -704,6 +751,14 @@ def run(settings: Settings) -> int:
     stage_assemble(settings, book)
     state.mark("assemble", status="done")
     logger.info("book.md at %s", run_dir / config.STAGE_DIRS["output"])
+
+    state.mark("format", status="started")
+    if not settings.no_format:
+        fmt_summary = stage_format(settings, book)
+        state.mark("format", status="done", **fmt_summary)
+        logger.info("formatted book.md: %s", fmt_summary)
+    else:
+        state.mark("format", status="done", skipped=True)
     state.save()
     return 0
 
@@ -770,8 +825,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="max MQM error spans per unit (default 12)")
     run_p.add_argument("--no-drift", action="store_true",
                        help="skip the glossary drift-mining stage (3.6)")
+    run_p.add_argument("--no-translated-html", action="store_true",
+                       help="skip the page-divided print edition HTML "
+                            "(rendered from the TMX)")
     run_p.add_argument("--no-artifacts", action="store_true",
                        help="skip appendix/bilingual/TMX/QA-report generation (3.1-3.5)")
+    run_p.add_argument("--no-format", action="store_true",
+                       help="skip the M5 AI formatting pass after assembly")
+    run_p.add_argument("--force-format", action="store_true",
+                       help="send every page to the format model, not only "
+                            "pages flagged by needs_format (M5)")
     run_p.add_argument("--log-level", default="INFO")
 
     sub.add_parser("stages", help="show pipeline stages")
@@ -831,6 +894,44 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("--poll-seconds", type=float, default=1.0,
                          help="SSE poll interval for state/chunk changes")
     serve_p.add_argument("--log-level", default="INFO")
+
+    print_p = sub.add_parser(
+        "print",
+        help="standalone: page-divided, print-ready HTML of the translated "
+             "book, rendered from a TMX (each sheet = one book page)",
+    )
+    print_p.add_argument("tmx", type=Path,
+                         help="TMX file (e.g. 07_output/book.tmx)")
+    print_p.add_argument("-o", "--output", type=Path, default=None,
+                         help="output HTML (default: translated.html next to "
+                              "the TMX)")
+    print_p.add_argument("--title", default=None,
+                         help="document title (default: the TMX book prop)")
+    print_p.add_argument("--log-level", default="INFO")
+
+    fmt_p = sub.add_parser(
+        "format",
+        help="M5 standalone: AI formatting pass on an already-assembled run "
+             "(archetype cards per page; verified layout-only edits)",
+    )
+    fmt_p.add_argument("run_dir", type=Path,
+                       help="run directory containing 07_output/book.md "
+                            "(runs/<book-id>)")
+    fmt_p.add_argument("--pages", nargs=2, type=int, metavar=("LO", "HI"),
+                       default=None,
+                       help="restrict formatting to pages LO..HI (inclusive)")
+    fmt_p.add_argument("--force", action="store_true",
+                       help="send every page to the model, not only pages "
+                            "flagged by needs_format")
+    fmt_p.add_argument("--model", default=None,
+                       help="force a formatting model (assist preference by "
+                            "default)")
+    fmt_p.add_argument("-o", "--out", type=Path, default=None,
+                       help="write the formatted markdown here instead of "
+                            "updating 07_output/book.md in place")
+    fmt_p.add_argument("--ollama-timeout", type=int, default=config.OLLAMA_TIMEOUT)
+    _add_server_flags(fmt_p)
+    fmt_p.add_argument("--log-level", default="INFO")
     return p
 
 
@@ -839,6 +940,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stages":
         for i, s in enumerate(STAGES, 1):
             print(f"{i}. {s}")
+        return 0
+
+    if args.command == "print":                 # TMX in, HTML out — no OCR needed
+        from book_harness.artifacts import render_translated_html
+
+        setup_logging(args.log_level)
+        tmx: Path = args.tmx.resolve()
+        if not tmx.exists():
+            logger.error("TMX not found: %s", tmx)
+            return 2
+        out = (args.output or tmx.parent / "translated.html").resolve()
+        summary = render_translated_html(tmx, out, title=args.title)
+        logger.info(
+            "print edition: %d pages, %d units -> %s",
+            summary["pages"], summary["units"], summary["path"],
+        )
         return 0
 
     if args.command == "serve":                 # needs no OCR input
@@ -853,6 +970,66 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError as exc:
             logger.error("%s", exc)
             return 2
+        return 0
+
+    if args.command == "format":            # M5 standalone: post-assembly pass
+        from book_harness.format import format_book
+        from book_harness.pages import classify_book, classify_markdown
+        from book_harness.translate import build_client
+
+        setup_logging(args.log_level)
+        run_dir = args.run_dir.resolve()
+        book_md_path = run_dir / "07_output" / "book.md"
+        if not book_md_path.exists():
+            logger.error("no assembled book at %s", book_md_path)
+            return 2
+        book_md = book_md_path.read_text(encoding="utf-8")
+
+        # Page composition: the consolidated Book model when the OCR JSON
+        # pair was kept in 00_source; markdown heuristics otherwise.
+        book = None
+        src = run_dir / "00_source"
+        if src.exists():
+            cands = [
+                p for p in src.glob("*.json")
+                if not p.name.endswith("_meta.json")
+                and p.name not in ("book-summary.json", "outline-repair.json")
+            ]
+            if cands:
+                book = Book.from_marker_json(cands[0])
+                logger.info("composition from %s", cands[0])
+        archetypes = classify_book(book) if book is not None \
+            else classify_markdown(book_md)
+        logger.info(
+            "composed %d page archetypes (%s source)", len(archetypes),
+            "Book" if book is not None else "markdown",
+        )
+
+        client = build_client(
+            args.ollama_host,
+            timeout=args.ollama_timeout,
+            preferred=config.FORMAT_MODELS,
+            api=args.api,
+            api_key=args.api_key,
+            model=args.model,
+        )
+        out_path = args.out.resolve() if args.out else book_md_path
+        summary, _report = format_book(
+            book_md,
+            archetypes,
+            client=client,
+            model=str(getattr(client, "model", "") or ""),
+            out_path=out_path,
+            format_dir=run_dir / "08_format",
+            report_path=run_dir / "09_qa" / "format-report.jsonl",
+            force=args.force,
+            pages_limit=tuple(args.pages) if args.pages else None,
+        )
+        state = RunState(run_dir)
+        state.mark("format", status="done", **summary)
+        state.save()
+        logger.info("formatted -> %s: %s", out_path, summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
     setup_logging(args.log_level)
@@ -889,7 +1066,10 @@ def main(argv: list[str] | None = None) -> int:
         refine_budget=getattr(args, "refine_budget", config.REFINE_BUDGET),
         max_spans=getattr(args, "max_spans", config.REFINE_MAX_SPANS),
         no_drift=getattr(args, "no_drift", False),
+        translated_html=not getattr(args, "no_translated_html", False),
         no_artifacts=getattr(args, "no_artifacts", False),
+        no_format=getattr(args, "no_format", False),
+        force_format=getattr(args, "force_format", False),
     )
     try:
         if args.command == "bakeoff":

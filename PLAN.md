@@ -106,6 +106,144 @@ book-harness/
 | 4.1 | Progress view | SSE streaming of stage/chunk progress from `state.json` |
 | 4.2 | Review screen | Human review of `uncertified` terms and low-QE chunks; decisions write back to `glossary.yaml` / re-queue chunks |
 
+### M5 — AI-aided post-processing per page archetype
+
+> AI (local LLM, assist role) reformats each assembled page of `book.md`
+> according to its **page archetype**, fixing text alignment, extra newlines,
+> lost list elements and other format defects — with deterministic guardrails
+> so wording never changes. Also runnable standalone on already-extracted runs.
+
+**Design decisions:**
+
+1. **Page archetype = derived concept.** The codebase has no page-level type
+   (`book.py` only defines per-block `BlockType`). A new classifier maps each
+   page's BlockType composition to one archetype.
+2. **Placement: new `format` stage after `assemble`.** Operates on the final
+   assembled Arabic `book.md`, split at the existing page comments
+   (`<!-- ===== page N ===== -->`). Post-processing before translation would be
+   reflowed anyway; after translation the formatting sticks.
+   **Standalone mode:** the stage can also be run by itself on an
+   already-extracted run directory (`book-harness format <run-dir>`) — it
+   reads that run's `07_output/book.md` + `manifest.json` (and the OCR JSON
+   pair only for page composition, falling back to heuristic composition when
+   missing), reformatting in place with the same per-page cache and verifier.
+   No translation, refinement, or QA stages are re-run.
+3. **Base + per-archetype prompt cards** stored in `config.py`
+   (`PAGE_FORMAT_SYSTEM`, `PAGE_FORMAT_ARCHETYPES`), with a separate
+   `FORMAT_PROMPT_VERSION` so formatting runs don't invalidate translation
+   caches.
+4. **Assist models only** (`ASSIST_MODELS` list, temperature 0) — this is
+   formatting, not translation.
+5. **Bounded edits with verification** (mirrors principle 5): deterministic
+   whitespace-insensitive structural diff per page; on violation → one retry
+   with a stricter reminder → fall back to original page text + log entry.
+6. **Skip clean pages:** deterministic `needs_format()` scorer gates which
+   pages reach the model (same philosophy as QE-budgeted refinement).
+7. **No reflow of RTL semantics:** formatting instructions are newline/
+   structure only; no left/right alignment heuristics.
+8. **Idempotent + standalone-runnable:** re-running formatting on an
+   already-formatted page yields no changes (per-page cache + boundary
+   re-split at page comments make it safe), and the stage works equally from
+   the full pipeline or on its own against an existing run directory.
+
+**Page archetype taxonomy** (first match by priority wins):
+
+| Archetype | Trigger (BlockType mix on the page) | Priority |
+|---|---|---|
+| `front_matter` | book's first N pages, mostly short/Other blocks (cover, title, edition) | 1 |
+| `toc` | contains `TableOfContents` | 2 |
+| `index` | trailing pages: many short Text lines ending in page numbers | 3 |
+| `list` | `ListGroup` present, or ≥3 list-item units / enumerated-line pattern | 4 |
+| `footnote` | `Footnote` blocks present | 5 |
+| `equation` | `Equation` present | 6 |
+| `code` | `Code` present | 7 |
+| `table` | `Table`/`TableGroup` present | 8 |
+| `figure` | `Figure`/`Picture`/`FigureGroup` present | 9 |
+| `narrative` | dominated by `Text`/`SectionHeader` | 10 |
+| `default` | anything else / heavy mix | 11 |
+
+**Instruction cards per archetype:**
+
+*Base card (all pages):*
+- You are a markdown layout formatter for an Arabic RTL technical book.
+- Only layout/structure may change; never reword, translate, summarize,
+  reorder blocks, or add content. Every word must survive (output is verified
+  against the input on a whitespace-insensitive basis).
+- Never touch: `§EQ0§`-style placeholder tokens, image markdown
+  `![…](images/…)`, numeric content, anything inside fenced code.
+- Paragraph = one line; exactly one blank line between blocks; headings in
+  ATX (`#`) form, max one per line; single space after sentence punctuation.
+- Freedom whitelist (only these): heading levels, `---` separators, bullet /
+  ordered markers and indentation, `>` callouts, bold/italic emphasis that
+  mirrors source emphasis.
+
+*Narrative:* join hyphen-broken and soft-wrapped lines into single-line
+paragraphs; collapse newline runs to one blank line; drop a leaked repeated
+running header/footer line (repeating across neighboring pages); never merge a
+paragraph into a following heading or list item.
+
+*List:* reconstruct lost list structure — lines beginning `1.` `١.` `a)` `أ)`
+`-` `•` `*` inside Text re-emitted as markdown list items (keep Arabic marker
+text); renumber only consecutive ordered sequences; nesting = 2-space indent
+per level, max 3; never merge items; never split an item onto a line after a
+blank. Source-side `ListGroup`/item cues provided.
+
+*Table:* pipe-tables: one row per line, uniform column count (escape stray
+`|`), regenerate separator row, drop empty OCR column stubs, no cell wrapping.
+HTML passthrough tables: verify only, structural edits forbidden.
+
+*Figure:* image lines stand alone (nothing glued to them); captions = one
+italic line immediately after their image; strip scan artifacts (stray `|`,
+stray quote glyphs).
+
+*Equation:* never edit, reorder, or split `§EQ…§` tokens or equation
+references; only clean surrounding narrative spacing.
+
+*Code:* wrap stray code fragments in fenced blocks with best-guess language;
+preserve intra-fence spacing exactly (no unwrapping); inline code → backticks.
+
+*TOC:* one entry per line; page numbers verbatim; consistent indentation per
+level; leaders `……` normalized to a single `… N`; whole page as one
+consistent list; original order preserved.
+
+*Footnote:* definitions as `[^n]: text`, one per line; inline markers as
+`[^n]`; never merge footnotes with body text.
+
+*Front-matter:* title → `#`; subtitle/author/edition lines kept separate;
+strip page-number/printer noise; preserve line emphasis.
+
+*Index:* one entry per line; keep `term, sub-entry, number` pattern and
+commas; original order preserved (no sorting).
+
+*Default/mixed:* base card only + light cleanup.
+
+**Tasks:**
+
+| # | Task | Details | Depends on |
+|---|---|---|---|
+| 5.1 | Archetype classifier | New `book_harness/pages.py`: per-page BlockType composition (from `Book`) → archetype; `page_lines()` helper to split/merge `book.md` at page comments; unit tests on the Flight Simulation run | — |
+| 5.2 | Prompt cards + config | `config.py`: `PAGE_FORMAT_SYSTEM` (base card), `PAGE_FORMAT_ARCHETYPES` dict, `FORMAT_PROMPT_VERSION = "fmt-v1"`; archetype-specific user-message builder | 5.1 |
+| 5.3 | Needs-format scorer | Pure function `needs_format(page_md) -> tuple[bool, list[str]]` with reasons (line-break density in paragraphs, broken enumerations, newline runs ≥3, doubled spaces, glued image/caption lines); unit tests | 5.1 |
+| 5.4 | Format stage (LLM calls) | `book_harness/format.py`: per-page call via existing `OllamaClient`/`OpenAIClient` with assist-model list; cache dir `08_format/cache/` keyed `hash(page_md + archetype + model + FORMAT_PROMPT_VERSION)`; writes `08_format/pages/page-NNN.md`; `state.json` stage `format` | 5.2, 5.3 |
+| 5.5 | Guardrail verifier | `verify_format(original, formatted)`: NFKC-normalize, strip all whitespace → char-signature counts (Arabic/Latin letters, digits) must match; placeholders + image links + fenced-code bodies byte-identical; list-marker additions only tolerated whitespace-insensitively; violation → 1 retry → original fallback + log | 5.4 |
+| 5.6 | CLI wiring | Add `format` to `STAGES` (after `assemble`); `--skip-format` / `--force-format` flags; report `09_qa/format-report.jsonl` (page, archetype, changed, reasons, violations); **standalone subcommand** `book-harness format <run-dir>` that locates the run's `07_output/book.md`, composition source and settings from `state.json`/manifest and runs only this stage (reformat in place; `--out` optional to write a copy instead) | 5.4, 5.5 |
+| 5.7 | Validation run | Full run on the Flight Simulation book; manually review ~10 pages of at least 4 different archetypes; confirm lists restored, paragraphs unwrapped, zero content-loss verifier hits reaching the output silently | all |
+
+**Exit criteria:** every processed page passes the structural verifier or fell
+back to the original (logged); list pages show restored bullets; no placeholder
+or image loss anywhere; resume works mid-format; running
+`book-harness format <run-dir>` on a completed run produces identical results
+to the in-pipeline stage (idempotency confirmed).
+
+**Risks / mitigations:**
+
+| Risk | Mitigation |
+|---|---|
+| Model rewrites content instead of formatting | Structural verifier + fallback (5.5) |
+| Formatting echoed as content (verbatim regression) | Explicit "output only the formatted page" instruction + verifier catch (5.5) |
+| Cost blowup across 500+ pages | `needs_format()` gate (5.3); assist-family models only (5.2) |
+| LLM destructively repairs tables | Deterministic pipe-table repair preferred; LLM only when repair fails (5.2 table card) |
+
 ---
 
 ## 3. Model & infrastructure decisions
@@ -139,6 +277,8 @@ runs/<book-id>/
   05_refine/          chunk-0001.spans.json, patches.jsonl, verdicts.jsonl
   06_qa/              qe-scores.jsonl, compliance.jsonl, consistency.jsonl
   07_output/          book.md / book.html, glossary-appendix.md, manifest.json
+  08_format/          pages/page-NNN.md, cache/ (per-page format cache)
+  09_qa/              format-report.jsonl
   state.json          stage cursor for resume
 ```
 
