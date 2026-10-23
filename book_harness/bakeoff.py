@@ -24,6 +24,7 @@ from typing import Any
 
 from book_harness import config
 from book_harness.assemble import DraftBook
+from book_harness.progress import work_bar
 from book_harness.qa import compliance_audit, qe_score_chunk
 from book_harness.translate import SummaryTracker, build_client, translate_chunk
 
@@ -118,50 +119,58 @@ def run_bakeoff(
     qe_client = _judge_client(settings, judge_model)
     results: dict[str, dict[str, Any]] = {}
 
-    for model in models:
-        slug = model.replace("/", "_").replace(":", "-")
-        dir_m = out_dir / slug
-        drafts_dir = dir_m / "04_drafts"
-        started = time.time()
-        translated = 0
-        try:
-            client = build_client(
-                settings.ollama_host,
-                timeout=settings.ollama_timeout,
-                preferred=[model],
-                api=settings.api,
-                api_key=settings.api_key,
-                model=model,
+    with work_bar(models, desc="bake-off models", unit="model") as mbar:
+        for model in mbar:
+            mbar.set_postfix_str(model)
+            slug = model.replace("/", "_").replace(":", "-")
+            dir_m = out_dir / slug
+            drafts_dir = dir_m / "04_drafts"
+            started = time.time()
+            translated = 0
+            try:
+                client = build_client(
+                    settings.ollama_host,
+                    timeout=settings.ollama_timeout,
+                    preferred=[model],
+                    api=settings.api,
+                    api_key=settings.api_key,
+                    model=model,
+                )
+            except (RuntimeError, ConnectionError, ValueError) as exc:
+                results[model] = {"error": str(exc)}
+                logger.warning("bake-off: model %s unavailable: %s", model, exc)
+                continue
+            summaries = SummaryTracker(
+                client, drafts_dir / "chapter-summary.json",
+                period=settings.summary_period,
             )
-        except (RuntimeError, ConnectionError, ValueError) as exc:
-            results[model] = {"error": str(exc)}
-            logger.warning("bake-off: model %s unavailable: %s", model, exc)
-            continue
-        summaries = SummaryTracker(
-            client, drafts_dir / "chapter-summary.json",
-            period=settings.summary_period,
-        )
-        for c in sample:
-            translate_chunk(
-                c.to_dict(), client, entries, drafts_dir,
-                prompt_version="bakeoff-v1", glossary_version=gv,
-                summaries=summaries,
+            if sample:
+                with work_bar(
+                    sample, desc=f"translating ({model})", unit="chunk",
+                    total=len(sample),
+                ) as sbar:
+                    for c in sbar:
+                        translate_chunk(
+                            c.to_dict(), client, entries, drafts_dir,
+                            prompt_version="bakeoff-v1", glossary_version=gv,
+                            summaries=summaries,
+                        )
+                        translated += 1
+                        sbar.set_postfix_str(c.chunk_id)
+            duration = round(time.time() - started, 1)
+            qe_rec, comp_rec = score_run(
+                sample, drafts_dir, entries, gv, qe_client
             )
-            translated += 1
-        duration = round(time.time() - started, 1)
-        qe_rec, comp_rec = score_run(
-            sample, drafts_dir, entries, gv, qe_client
-        )
-        agg = aggregate(qe_rec, comp_rec)
-        agg.update({
-            "model": client.model,
-            "chunks_translated": translated,
-            "duration_sec": duration,
-            "judge": getattr(qe_client, "model", ""),
-            "drafts_dir": str(drafts_dir),
-        })
-        results[model] = agg
-        logger.info("bake-off %s: %s", model, agg)
+            agg = aggregate(qe_rec, comp_rec)
+            agg.update({
+                "model": client.model,
+                "chunks_translated": translated,
+                "duration_sec": duration,
+                "judge": getattr(qe_client, "model", ""),
+                "drafts_dir": str(drafts_dir),
+            })
+            results[model] = agg
+            logger.info("bake-off %s: %s", model, agg)
 
     _write_report(results, out_dir / "bakeoff.json", out_dir / "bakeoff.md")
     return out_dir / "bakeoff.md"

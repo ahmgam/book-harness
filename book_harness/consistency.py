@@ -49,6 +49,7 @@ from book_harness.glossary import (
 )
 from book_harness.glossary_pages import _dedupe_key
 from book_harness.llm_terms import strip_think
+from book_harness.progress import work_bar
 
 
 class _Decision:
@@ -176,57 +177,63 @@ def choose_translations(
     counts = {"chosen": 0, "fallback": 0, "skipped": 0}
     records: list[dict[str, Any]] = []
 
-    for entry in entries:
-        status = entry.get("status")
-        if status == STATUS_UNCERTIFIED:
-            counts["skipped"] += 1
-            continue
-        dec = _Decision(entry)
-        if len(dec.options) < 2:
-            counts["skipped"] += 1
-            continue
-        occurrences = (by_term.get(_dedupe_key(dec.term), {}).get(
-            "occurrences") or [])
-        cached = decisions.get(dec.key)
-        if cached:
-            chosen, via, why = cached["chosen"], "cache", ""
-            model = str(cached.get("model") or model)
-        else:
-            if client is None:
-                try:
-                    client = assist_factory() if assist_factory else None
-                except Exception as exc:
-                    logger.warning(
-                        "assist client unavailable for glossary consistency "
-                        "(%s); deterministic fallback", exc,
-                    )
-            if client is None:
-                counts["fallback"] += 1
-                records.append(dec.record(
-                    None, "fallback", len(occurrences), "",
-                    why="no assist client available",
-                ))
+    with work_bar(entries, desc="consistency", unit="entry", total=len(entries)) as pbar:
+        for entry in pbar:
+            status = entry.get("status")
+            if status == STATUS_UNCERTIFIED:
+                counts["skipped"] += 1
                 continue
-            model = str(getattr(client, "model", "") or "")
-            chosen, via, why = _ask_model(
-                client, dec, occurrences, domains, logger
-            )
-        if chosen is None:
-            counts["fallback"] += 1
-            entry["reason"] = (
-                f"glossary consistency: {why or 'no choice'}; "
-                "kept highest dictionary priority"
-            )
-        else:
-            counts["chosen"] += 1
-            entry["term_ar"] = chosen
-            entry["decided_by"] = "llm_context"
-            entry["status"] = STATUS_LLM_CHOSEN
-            entry["reason"] = (
-                f"selected from {len(dec.options)} options using "
-                f"{len(occurrences)} occurrence chunk(s)"
-            )
-        records.append(dec.record(chosen, via, len(occurrences), model, why))
+            dec = _Decision(entry)
+            if len(dec.options) < 2:
+                counts["skipped"] += 1
+                continue
+            pbar.set_postfix_str(dec.term)
+            occurrences = (by_term.get(_dedupe_key(dec.term), {}).get(
+                "occurrences") or [])
+            cached = decisions.get(dec.key)
+            if cached:
+                chosen, via, why = cached["chosen"], "cache", ""
+                model = str(cached.get("model") or model)
+            else:
+                if client is None:
+                    try:
+                        client = assist_factory() if assist_factory else None
+                    except Exception as exc:
+                        logger.warning(
+                            "assist client unavailable for glossary consistency "
+                            "(%s); deterministic fallback", exc,
+                        )
+                if client is None:
+                    counts["fallback"] += 1
+                    records.append(dec.record(
+                        None, "fallback", len(occurrences), "",
+                        why="no assist client available",
+                    ))
+                    continue
+                model = str(getattr(client, "model", "") or "")
+                chosen, via, why = _ask_model(
+                    client, dec, occurrences, domains, logger
+                )
+            if chosen is None:
+                counts["fallback"] += 1
+                entry["reason"] = (
+                    f"glossary consistency: {why or 'no choice'}; "
+                    "kept highest dictionary priority"
+                )
+            else:
+                counts["chosen"] += 1
+                entry["term_ar"] = chosen
+                entry["decided_by"] = "llm_context"
+                entry["status"] = STATUS_LLM_CHOSEN
+                entry["reason"] = (
+                    f"selected from {len(dec.options)} options using "
+                    f"{len(occurrences)} occurrence chunk(s)"
+                )
+            records.append(dec.record(chosen, via, len(occurrences), model, why))
+        pbar.set_description_str(
+            "consistency (chosen: {chosen}, fallback: {fallback}, "
+            "skipped: {skipped})".format(**counts)
+        )
 
     if records:
         if out_dir is not None:

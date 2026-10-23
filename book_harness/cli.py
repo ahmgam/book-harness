@@ -25,6 +25,7 @@ from book_harness.arabterm import Arabterm, ensure_db
 from book_harness.book import Book
 from book_harness.chunker import plan_chunks, write_chunks
 from book_harness.config import Settings, setup_logging
+from book_harness.progress import StagePipeline, planned_stages, work_bar
 from book_harness.state import RunState
 
 logger = logging.getLogger("book-harness")
@@ -76,12 +77,28 @@ def stage_terms(settings: Settings, book: Book) -> list[dict]:
         book, char_ceiling=settings.char_ceiling, char_floor=settings.char_floor
     )
     candidates = occurrences_mod.attach_occurrences(candidates, chunks)
+    # LLM term verification (PLAN §9 task B): field-agnostic expertise filter
+    # over the survivors. Graceful — no assist model just skips the pass.
+    try:
+        verify_client = _assist_client(settings)
+    except Exception as exc:
+        verify_client = None
+        logger.warning(
+            "term verification skipped: no assist model available (%s)", exc
+        )
+    candidates = llm_terms_mod.verify_candidates(
+        candidates,
+        verify_client,
+        cache_path=out / config.VERIFY_CACHE_FILE,
+        logger=logger,
+    )
     n = terms_mod.write_candidates(candidates, out / config.CANDIDATES_FILE)
     logger.info(
         "extracted %d term candidates (extract model: %s, book-glossary: %d, "
-        "with occurrences: %d)",
+        "with occurrences: %d, kept by verify: %d)",
         n, getattr(extract, "model", "?"), len(page_terms),
         sum(1 for c in candidates if c.get("occurrences")),
+        len(candidates),
     )
     return candidates
 
@@ -201,15 +218,19 @@ def stage_translate(settings: Settings, chunks: list) -> int:
         period=settings.summary_period,
     )
     done = 0
-    for c in chunks:
-        translate_chunk(
-            c.to_dict(), client, entries, drafts_dir,
-            prompt_version=settings.prompt_version,
-            glossary_version=_glossary_version(settings),
-            summaries=summaries,
-        )
-        done += 1
-        logger.info("translated %s (%d/%d)", c.chunk_id, done, len(chunks))
+    with work_bar(
+        chunks, desc="translating", unit="chunk", total=len(chunks)
+    ) as pbar:
+        for c in pbar:
+            pbar.set_postfix_str(c.chunk_id)
+            translate_chunk(
+                c.to_dict(), client, entries, drafts_dir,
+                prompt_version=settings.prompt_version,
+                glossary_version=_glossary_version(settings),
+                summaries=summaries,
+            )
+            done += 1
+            logger.info("translated %s (%d/%d)", c.chunk_id, done, len(chunks))
     return done
 
 
@@ -351,33 +372,42 @@ def stage_qe(settings: Settings, chunks: list) -> dict[str, dict]:
     path = qa_dir / "qe-scores.jsonl"
     scores: dict[str, dict] = latest_by_chunk(read_records(path))
     scored = 0
-    for c in chunks:
-        cd = c.to_dict()
-        draft = drafts_meta.get(c.chunk_id)
-        if not draft:
-            continue
-        # resume: skip when draft+scorer identity is unchanged
-        key = qe_cache_key(
-            draft_pairs(cd, draft),
-            qe_prompt_version=config.QE_PROMPT_VERSION,
-            model=str(effective_model or ""),
-            method=effective_method,
-            chunk_id=c.chunk_id,
-        )
-        existing = scores.get(c.chunk_id)
-        if existing and existing.get("cache_key") == key and existing.get("finished"):
-            continue
-        record = qe_score_chunk(
-            cd, draft, client,
-            qe_prompt_version=config.QE_PROMPT_VERSION,
-            comet=comet, method=settings.qe_method,
-        )
-        scores[c.chunk_id] = record
-        scored += 1
-        logger.info(
-            "qe %s: score=%s (%s, %d units)",
-            c.chunk_id, record["score"], record["method"], len(record["unit_scores"]),
-        )
+    with work_bar(
+        chunks, desc="qe scoring", unit="chunk", total=len(chunks)
+    ) as pbar:
+        for c in pbar:
+            pbar.set_postfix_str(c.chunk_id)
+            cd = c.to_dict()
+            draft = drafts_meta.get(c.chunk_id)
+            if not draft:
+                continue
+            # resume: skip when draft+scorer identity is unchanged
+            key = qe_cache_key(
+                draft_pairs(cd, draft),
+                qe_prompt_version=config.QE_PROMPT_VERSION,
+                model=str(effective_model or ""),
+                method=effective_method,
+                chunk_id=c.chunk_id,
+            )
+            existing = scores.get(c.chunk_id)
+            if existing and existing.get("cache_key") == key \
+                    and existing.get("finished"):
+                continue
+            record = qe_score_chunk(
+                cd, draft, client,
+                qe_prompt_version=config.QE_PROMPT_VERSION,
+                comet=comet, method=settings.qe_method,
+            )
+            scores[c.chunk_id] = record
+            scored += 1
+            pbar.set_description_str(
+                f"qe scoring ({scored} new, {len(chunks) - scored} skipped)"
+            )
+            logger.info(
+                "qe %s: score=%s (%s, %d units)",
+                c.chunk_id, record["score"], record["method"],
+                len(record["unit_scores"]),
+            )
     write_records(scores.values(), path)
     return scores
 
@@ -406,20 +436,25 @@ def stage_refine(settings: Settings, chunks: list) -> int:
     client = _assist_client(settings)
     refine_dir = settings.run_dir() / config.STAGE_DIRS["refine"]
     done = 0
-    for chunk_dict, score in plan:
-        refined = refine_chunk(
-            chunk_dict, drafts_meta[chunk_dict["chunk_id"]], client, refine_dir,
-            draft_cache_key=drafts_meta[chunk_dict["chunk_id"]].get("cache_key", ""),
-            prompt_version=config.REFINE_PROMPT_VERSION,
-            max_spans=settings.max_spans,
-        )
-        done += 1
-        counters = refined["counters"]
-        logger.info(
-            "refined %s (qe=%.0f): %d spans, %d patches accepted, %d rejected (%d/%d)",
-            chunk_dict["chunk_id"], score, counters["spans"],
-            counters["accepted"], counters["rejected"], done, len(plan),
-        )
+    with work_bar(plan, desc="refining", unit="chunk", total=len(plan)) as pbar:
+        for chunk_dict, score in pbar:
+            pbar.set_postfix_str(chunk_dict["chunk_id"])
+            refined = refine_chunk(
+                chunk_dict, drafts_meta[chunk_dict["chunk_id"]], client, refine_dir,
+                draft_cache_key=drafts_meta[chunk_dict["chunk_id"]].get(
+                    "cache_key", ""
+                ),
+                prompt_version=config.REFINE_PROMPT_VERSION,
+                max_spans=settings.max_spans,
+            )
+            done += 1
+            counters = refined["counters"]
+            logger.info(
+                "refined %s (qe=%.0f): %d spans, %d patches accepted, "
+                "%d rejected (%d/%d)",
+                chunk_dict["chunk_id"], score, counters["spans"],
+                counters["accepted"], counters["rejected"], done, len(plan),
+            )
     return done
 
 
@@ -429,12 +464,16 @@ def _compliance_records(settings: Settings, chunks: list, entries: list[dict]) -
     records = []
     drafts_meta = _drafts_meta(settings)
     glossary_version = _glossary_version(settings)
-    for c in chunks:
-        rec = compliance_audit(
-            c.to_dict(), drafts_meta.get(c.chunk_id), entries,
-            glossary_version=glossary_version,
-        )
-        records.append(rec)
+    with work_bar(
+        chunks, desc="compliance audit", unit="chunk", total=len(chunks)
+    ) as pbar:
+        for c in pbar:
+            rec = compliance_audit(
+                c.to_dict(), drafts_meta.get(c.chunk_id), entries,
+                glossary_version=glossary_version,
+            )
+            records.append(rec)
+            pbar.set_postfix_str(c.chunk_id)
     return records
 
 
@@ -473,23 +512,24 @@ def stage_compliance(settings: Settings, chunks: list, entries: list[dict]) -> l
         ]
         for r in requeue
     }
-    for c in chunks:
-        if c.chunk_id not in violated_terms:
-            continue
-        logger.info(
-            "re-queuing %s for targeted re-translation (%d violations)",
-            c.chunk_id, len(violated_terms[c.chunk_id]),
-        )
-        translate_chunk(
-            c.to_dict(), client, entries, drafts_dir,
-            prompt_version=settings.prompt_version,
-            glossary_version=glossary_version,
-            summaries=summaries,
-            emphasis=violated_terms[c.chunk_id],
-        )
-    after = _compliance_records(settings, [
-        c for c in chunks if c.chunk_id in violated_terms
-    ], entries)
+    targets = [c for c in chunks if c.chunk_id in violated_terms]
+    with work_bar(
+        targets, desc="re-translating", unit="chunk", total=len(targets)
+    ) as pbar:
+        for c in pbar:
+            pbar.set_postfix_str(c.chunk_id)
+            logger.info(
+                "re-queuing %s for targeted re-translation (%d violations)",
+                c.chunk_id, len(violated_terms[c.chunk_id]),
+            )
+            translate_chunk(
+                c.to_dict(), client, entries, drafts_dir,
+                prompt_version=settings.prompt_version,
+                glossary_version=glossary_version,
+                summaries=summaries,
+                emphasis=violated_terms[c.chunk_id],
+            )
+    after = _compliance_records(settings, targets, entries)
     requeue_ids = {r["chunk_id"] for r in requeue}
     records = [t for t in records if t["chunk_id"] not in requeue_ids] + after
     write_records(records, path)
@@ -707,26 +747,33 @@ def drift_confirm(
     )
     enforced = [(c["en"], c["ar"]) for c in confirms if c["ar"]]
     rerun: list[str] = []
-    for c in chunks:
-        chunk_dict = c.to_dict()
-        pairs = [
+
+    def _pairs(chunk) -> list[tuple[str, str]]:
+        chunk_dict = chunk.to_dict()
+        return [
             (en, ar) for en, ar in enforced
             if drift_mod.affected_chunks([chunk_dict], en)
         ]
-        if not pairs:
-            continue
-        logger.info(
-            "drift confirm: re-queuing %s (%d new terms in source)",
-            c.chunk_id, len(pairs),
-        )
-        translate_chunk(
-            c.to_dict(), client, entries, drafts_dir,
-            prompt_version=settings.prompt_version,
-            glossary_version=new_version,
-            summaries=summaries,
-            emphasis=pairs,
-        )
-        rerun.append(c.chunk_id)
+
+    targets = [c for c in chunks if _pairs(c)]
+    with work_bar(
+        targets, desc="re-translating", unit="chunk", total=len(targets)
+    ) as pbar:
+        for c in pbar:
+            pairs = _pairs(c)
+            pbar.set_postfix_str(c.chunk_id)
+            logger.info(
+                "drift confirm: re-queuing %s (%d new terms in source)",
+                c.chunk_id, len(pairs),
+            )
+            translate_chunk(
+                c.to_dict(), client, entries, drafts_dir,
+                prompt_version=settings.prompt_version,
+                glossary_version=new_version,
+                summaries=summaries,
+                emphasis=pairs,
+            )
+            rerun.append(c.chunk_id)
     state = RunState(run_dir)
     state.mark(
         "drift-confirm", status="done", terms=[e["term_en"] for e in appended],
@@ -779,106 +826,129 @@ def run(settings: Settings) -> int:
     )
 
     src_summary = run_dir / config.STAGE_DIRS["source"] / "book-summary.json"
-    if not src_summary.exists():
-        state.mark("source", status="started")
-        stage_source(settings, book)
-        state.mark("source", status="done", pages=book.num_pages,
-                   blocks=len(book.blocks))
-        logger.info("stage source: done")
+    with StagePipeline(
+        planned_stages(settings, needs_source=not src_summary.exists())
+    ) as stages:
+        if not src_summary.exists():
+            with stages.stage("source"):
+                state.mark("source", status="started")
+                stage_source(settings, book)
+                state.mark("source", status="done", pages=book.num_pages,
+                           blocks=len(book.blocks))
+            logger.info("stage source: done")
 
-    state.mark("outline-repair", status="started")
-    outline_summary = stage_outline_repair(settings, book)
-    state.mark("outline-repair", status="done",
-               repaired=outline_summary["sections_repaired"])
+        with stages.stage("outline-repair"):
+            state.mark("outline-repair", status="started")
+            outline_summary = stage_outline_repair(settings, book)
+            state.mark("outline-repair", status="done",
+                       repaired=outline_summary["sections_repaired"])
 
-    state.mark("terms", status="started")
-    candidates = stage_terms(settings, book)
-    book_glossary_pages = pages_mod.find_glossary_pages(book)
-    state.mark(
-        "terms", status="done",
-        candidates=len(candidates),
-        book_glossary_pages=(
-            sum(len(r) for r in book_glossary_pages)
-            if book_glossary_pages else None
-        ),
-    )
+        with stages.stage("terms"):
+            state.mark("terms", status="started")
+            candidates = stage_terms(settings, book)
+            book_glossary_pages = pages_mod.find_glossary_pages(book)
+            state.mark(
+                "terms", status="done",
+                candidates=len(candidates),
+                book_glossary_pages=(
+                    sum(len(r) for r in book_glossary_pages)
+                    if book_glossary_pages else None
+                ),
+            )
 
-    state.mark("glossary", status="started")
-    entries, version, _path = stage_glossary(settings, candidates)
-    state.mark("glossary", status="done", entries=len(entries), version=version)
+        with stages.stage("glossary"):
+            state.mark("glossary", status="started")
+            entries, version, _path = stage_glossary(settings, candidates)
+            state.mark(
+                "glossary", status="done", entries=len(entries), version=version
+            )
 
-    state.mark("consistency", status="started")
-    entries, version, _ = stage_consistency(settings, candidates, entries)
-    state.mark("consistency", status="done", version=version)
+        with stages.stage("consistency"):
+            state.mark("consistency", status="started")
+            entries, version, _ = stage_consistency(settings, candidates, entries)
+            state.mark("consistency", status="done", version=version)
 
-    state.mark("chunk", status="started")
-    chunks = stage_chunk(settings, book)
-    state.mark("chunk", status="done", chunks=len(chunks))
+        with stages.stage("chunk"):
+            state.mark("chunk", status="started")
+            chunks = stage_chunk(settings, book)
+            state.mark("chunk", status="done", chunks=len(chunks))
 
-    state.mark("gate", status="started")
-    gate_summary = stage_gate(settings, book)
-    state.mark("gate", status="done", flagged=gate_summary["flagged"])
+        with stages.stage("gate"):
+            state.mark("gate", status="started")
+            gate_summary = stage_gate(settings, book)
+            state.mark("gate", status="done", flagged=gate_summary["flagged"])
 
-    if not settings.translate:
-        logger.info("translation skipped (--no-translate)")
+        if not settings.translate:
+            logger.info("translation skipped (--no-translate)")
+            state.save()
+            return 0
+
+        with stages.stage("translate"):
+            state.mark("translate", status="started")
+            n_translated = stage_translate(settings, chunks)
+            state.mark("translate", status="done", chunks=n_translated)
+
+        _, entries, _ = _load_glossary(settings)
+
+        state.mark("qe", status="started")
+        if settings.qe_method != "none":
+            with stages.stage("qe"):
+                scores = stage_qe(settings, chunks)
+            state.mark("qe", status="done", chunks=len(scores))
+        else:
+            scores = {}
+            state.mark("qe", status="done", skipped=True)
+
+        state.mark("refine", status="started")
+        if settings.refine:
+            with stages.stage("refine"):
+                n_refined = stage_refine(settings, chunks)
+            state.mark("refine", status="done", chunks=n_refined)
+        else:
+            state.mark("refine", status="done", skipped=True)
+
+        with stages.stage("compliance"):
+            state.mark("compliance", status="started")
+            stage_compliance(settings, chunks, entries)
+            state.mark("compliance", status="done")
+
+        with stages.stage("drift-audit"):
+            state.mark("drift-audit", status="started")
+            stage_drift_audit(settings, chunks, entries)
+            state.mark("drift-audit", status="done")
+
+        state.mark("drift", status="started")
+        if not settings.no_drift:
+            with stages.stage("drift"):
+                drift_summary = stage_drift(settings, chunks)
+            state.mark(
+                "drift", status="done", candidates=drift_summary["candidates"]
+            )
+        else:
+            state.mark("drift", status="done", skipped=True)
+
+        state.mark("artifacts", status="started")
+        if not settings.no_artifacts:
+            with stages.stage("artifacts"):
+                stage_artifacts(settings, book, chunks)
+        state.mark("artifacts", status="done", skipped=settings.no_artifacts)
+
+        with stages.stage("assemble"):
+            state.mark("assemble", status="started")
+            stage_assemble(settings, book)
+            state.mark("assemble", status="done")
+        logger.info("book.md at %s", run_dir / config.STAGE_DIRS["output"])
+
+        state.mark("format", status="started")
+        if not settings.no_format:
+            with stages.stage("format"):
+                fmt_summary = stage_format(settings, book)
+            state.mark("format", status="done", **fmt_summary)
+            logger.info("formatted book.md: %s", fmt_summary)
+        else:
+            state.mark("format", status="done", skipped=True)
         state.save()
         return 0
-
-    state.mark("translate", status="started")
-    n_translated = stage_translate(settings, chunks)
-    state.mark("translate", status="done", chunks=n_translated)
-
-    _, entries, _ = _load_glossary(settings)
-
-    state.mark("qe", status="started")
-    if settings.qe_method != "none":
-        scores = stage_qe(settings, chunks)
-        state.mark("qe", status="done", chunks=len(scores))
-    else:
-        scores = {}
-        state.mark("qe", status="done", skipped=True)
-
-    state.mark("refine", status="started")
-    if settings.refine:
-        n_refined = stage_refine(settings, chunks)
-        state.mark("refine", status="done", chunks=n_refined)
-    else:
-        state.mark("refine", status="done", skipped=True)
-
-    state.mark("compliance", status="started")
-    stage_compliance(settings, chunks, entries)
-    state.mark("compliance", status="done")
-
-    state.mark("drift-audit", status="started")
-    stage_drift_audit(settings, chunks, entries)
-    state.mark("drift-audit", status="done")
-
-    state.mark("drift", status="started")
-    if not settings.no_drift:
-        drift_summary = stage_drift(settings, chunks)
-        state.mark("drift", status="done", candidates=drift_summary["candidates"])
-    else:
-        state.mark("drift", status="done", skipped=True)
-
-    state.mark("artifacts", status="started")
-    if not settings.no_artifacts:
-        stage_artifacts(settings, book, chunks)
-    state.mark("artifacts", status="done", skipped=settings.no_artifacts)
-
-    state.mark("assemble", status="started")
-    stage_assemble(settings, book)
-    state.mark("assemble", status="done")
-    logger.info("book.md at %s", run_dir / config.STAGE_DIRS["output"])
-
-    state.mark("format", status="started")
-    if not settings.no_format:
-        fmt_summary = stage_format(settings, book)
-        state.mark("format", status="done", **fmt_summary)
-        logger.info("formatted book.md: %s", fmt_summary)
-    else:
-        state.mark("format", status="done", skipped=True)
-    state.save()
-    return 0
 
 
 # ---------------------------------------------------------------------------

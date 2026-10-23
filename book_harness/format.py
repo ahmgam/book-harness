@@ -38,6 +38,7 @@ from book_harness.config import (
     PAGE_FORMAT_ARCHETYPES,
     PAGE_FORMAT_SYSTEM,
 )
+from book_harness.progress import work_bar
 
 logger = logging.getLogger(__name__)
 
@@ -310,64 +311,73 @@ def format_book(
     report: list[dict] = []
     formatted: dict[int, str] = {}
     counters = Counter()
-    for pg, original in sorted(pages.items()):
-        archetype = archetypes.get(pg, PageArchetype.DEFAULT)
-        cleaned = cosmetic_clean(original)
-        needs, reasons = needs_format(cleaned)
-        rec: dict[str, Any] = {
-            "page": pg, "archetype": archetype.value,
-            "cosmetic": cleaned != original, "reasons": reasons,
-            "cache": False, "fallback": None, "verifier_ok": True,
-        }
-        if force or needs:
-            counters["model_pages"] += 1
-            key = _cache_key(cleaned, archetype.value, model, prompt_version)
-            cache_path = cache_dir / f"{key}.md"
-            text = None
-            if cache_path.exists():
-                text = cache_path.read_text(encoding="utf-8")
-                rec["cache"] = True
-                counters["cache_hits"] += 1
-            else:
-                try:
-                    text = format_page(client, archetype, cleaned)
-                    ok, violations = verify_format(cleaned, text)
-                    if not ok:
-                        retry = format_page(client, archetype, cleaned,
-                                            violations=violations)
-                        ok2, _viol2 = verify_format(cleaned, retry)
-                        if ok2:
-                            text = retry
-                            rec["retried"] = True
-                except Exception as exc:       # noqa: BLE001 - keep going
-                    logger.warning("page %d: model call failed: %s", pg, exc)
-                    rec["fallback"] = f"model-error: {exc}"
-                if not text or not text.strip():
-                    text = cleaned
+    ordered = sorted(pages.items())
+    with work_bar(ordered, desc="formatting", unit="page") as pbar:
+        for pg, original in pbar:
+            pbar.set_postfix_str(f"page {pg}")
+            archetype = archetypes.get(pg, PageArchetype.DEFAULT)
+            cleaned = cosmetic_clean(original)
+            needs, reasons = needs_format(cleaned)
+            rec: dict[str, Any] = {
+                "page": pg, "archetype": archetype.value,
+                "cosmetic": cleaned != original, "reasons": reasons,
+                "cache": False, "fallback": None, "verifier_ok": True,
+            }
+            if force or needs:
+                counters["model_pages"] += 1
+                key = _cache_key(cleaned, archetype.value, model, prompt_version)
+                cache_path = cache_dir / f"{key}.md"
+                text = None
+                if cache_path.exists():
+                    text = cache_path.read_text(encoding="utf-8")
+                    rec["cache"] = True
+                    counters["cache_hits"] += 1
+                else:
+                    try:
+                        text = format_page(client, archetype, cleaned)
+                        ok, violations = verify_format(cleaned, text)
+                        if not ok:
+                            retry = format_page(client, archetype, cleaned,
+                                                violations=violations)
+                            ok2, _viol2 = verify_format(cleaned, retry)
+                            if ok2:
+                                text = retry
+                                rec["retried"] = True
+                    except Exception as exc:   # noqa: BLE001 - keep going
+                        logger.warning("page %d: model call failed: %s", pg, exc)
+                        rec["fallback"] = f"model-error: {exc}"
+                    if not text or not text.strip():
+                        text = cleaned
+                        if not rec["fallback"]:
+                            rec["fallback"] = "empty-output"
                     if not rec["fallback"]:
-                        rec["fallback"] = "empty-output"
-                if not rec["fallback"]:
-                    cache_path.write_text(text, encoding="utf-8")
-        else:
-            text = cleaned
-            if rec["cosmetic"]:
-                counters["cosmetic_only"] += 1
+                        cache_path.write_text(text, encoding="utf-8")
+            else:
+                text = cleaned
+                if rec["cosmetic"]:
+                    counters["cosmetic_only"] += 1
 
-        ok, _viol = verify_format(original, text)
-        rec["verifier_ok"] = ok
-        rec["changed"] = text.strip() != original.strip()
-        if not ok and not rec.get("fallback"):
-            rec["fallback"] = "verifier-violation"
-            text = original
+            ok, _viol = verify_format(original, text)
+            rec["verifier_ok"] = ok
             rec["changed"] = text.strip() != original.strip()
-        if rec.get("fallback"):
-            counters["fallbacks"] += 1
-        if rec["changed"]:
-            counters["changed_pages"] += 1
-        report.append(rec)
-        formatted[pg] = text
-        (pages_dir / f"page-{pg:03d}.md").write_text(
-            text if text.endswith("\n") else text + "\n", encoding="utf-8"
+            if not ok and not rec.get("fallback"):
+                rec["fallback"] = "verifier-violation"
+                text = original
+                rec["changed"] = text.strip() != original.strip()
+            if rec.get("fallback"):
+                counters["fallbacks"] += 1
+            if rec["changed"]:
+                counters["changed_pages"] += 1
+            report.append(rec)
+            formatted[pg] = text
+            (pages_dir / f"page-{pg:03d}.md").write_text(
+                text if text.endswith("\n") else text + "\n", encoding="utf-8"
+            )
+        pbar.set_description_str(
+            "formatting ({mp} via model, {ch} cached, {fb} fallbacks)".format(
+                mp=counters["model_pages"], ch=counters["cache_hits"],
+                fb=counters["fallbacks"],
+            )
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

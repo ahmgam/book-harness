@@ -124,32 +124,37 @@ def extract_page_terms(
         )
     pages = sorted({p for r in page_ranges for p in r})
     per_page: dict[int, list[str]] = {}
-    for page in pages:
-        text = page_text(book, page)
-        if not text.strip():
-            raise RuntimeError(
-                f"glossary page {page}: no text extracted from OCR blocks"
-            )
-        prompt = config.GLOSSARY_HARVEST_USER.format(text=text)
-        try:
-            reply = assist_client.generate(
-                prompt,
-                system=config.GLOSSARY_HARVEST_SYSTEM,
-                options=dict(config.GENERATE_OPTIONS),
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"glossary page {page}: assist model call failed: {exc}"
-            ) from exc
-        terms = parse_term_lines(reply)
-        if not terms:
-            raise RuntimeError(
-                f"glossary page {page}: assist model returned no terms: "
-                f"{reply[:120]!r}"
-            )
-        per_page[page] = terms
-        if logger:
-            logger.info("glossary page %d: %d terms", page, len(terms))
+
+    from book_harness.progress import work_bar
+
+    with work_bar(pages, desc="glossary harvest", unit="page") as pbar:
+        for page in pbar:
+            pbar.set_postfix_str(f"page {page}")
+            text = page_text(book, page)
+            if not text.strip():
+                raise RuntimeError(
+                    f"glossary page {page}: no text extracted from OCR blocks"
+                )
+            prompt = config.GLOSSARY_HARVEST_USER.format(text=text)
+            try:
+                reply = assist_client.generate(
+                    prompt,
+                    system=config.GLOSSARY_HARVEST_SYSTEM,
+                    options=dict(config.GENERATE_OPTIONS),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"glossary page {page}: assist model call failed: {exc}"
+                ) from exc
+            terms = parse_term_lines(reply)
+            if not terms:
+                raise RuntimeError(
+                    f"glossary page {page}: assist model returned no terms: "
+                    f"{reply[:120]!r}"
+                )
+            per_page[page] = terms
+            if logger:
+                logger.info("glossary page %d: %d terms", page, len(terms))
     candidates = build_candidates(per_page)
     if logger:
         logger.info(

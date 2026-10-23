@@ -483,3 +483,64 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
   arabterm certification filter downstream; drift mining still catches remnants.
 - **Runtime**: ~1 LLM call per chunk (~1200 chars in, short output), bounded by
   the extraction cache on re-runs.
+
+---
+
+## 9. Technical-term focus filters (M7, 2026-10-23)
+
+> The v2 extraction surfaces ordinary English words ("of", "hair") as
+> candidates, because `parse_term_lines` enforces *format* but nothing checks
+> *technicality*, and the chunk-frequency score actually **favors** broadly-used
+> everyday words. "Hair" is a legitimate technical term in a dermatology book —
+> so the fix cannot be one static list; it must be layered: cheap deterministic
+> filters first, then a context-aware LLM verification pass over the survivors.
+
+### Design decisions
+
+| Decision | Choice |
+|---|---|
+| Prompt hardening (A0) | Negative frame + layperson rule + few-shot sample in `EXTRACT_SYSTEM`/`EXTRACT_USER`; `EXTRACT_PROMPT_ID = "extract-v3"` (invalidates stale extract cache by design) |
+| Deterministic filters (A) | New `book_harness/term_filter.py`: stopword/word-shape hard drop per chunk + frequency-aware zipf (commonness) gate at aggregation |
+| Commonness signal | `wordfreq.zipf_frequency(term, "en")` (pure-Python dep with packaged data); everyday words zipf ≥ `EXTRACT_ZIPF_FILTER`, jargon ≤ ~4.5 |
+| Field-dependent escape hatch | A high-zipf single word survives **only** if reported by ≥ `EXTRACT_JARGON_MIN_FREQ` chunks (pervasive use = domain jargon, e.g. "hair" in a dermatology book) |
+| LLM verification pass (B) | New `llm_terms.verify_candidates()`: assist model, batches of ~100 top candidates with freq + sections → "keep/drop per term"; **graceful** (missing/failed assist client → warn + pass through, never fails the stage — accuracy upgrade, not an assure-fail dependency) |
+| Dictionary-first mode (C) | Rejected for now: arabterm coverage is thin for social-science fields; recall risk |
+| Selection signal | `EXTRACT_MIN_FREQ` knob so freq==1 one-offs can be gated below the top-N cut |
+
+### Config additions (`config.py`)
+
+- `EXTRACT_ZIPF_FILTER = 5.0` (real-data tuned), `EXTRACT_ZIPF_RARE = 4.8`,
+  `EXTRACT_JARGON_MIN_FREQ = 4`, `EXTRACT_MIN_FREQ = 1`
+- `VERIFY_SYSTEM` / `VERIFY_USER`, `VERIFY_PROMPT_ID = "verify-v1"`,
+  `VERIFY_CACHE_FILE = "verify-cache.jsonl"`, `VERIFY_BATCH_SIZE = 100`,
+  `VERIFY_GENERATE_OPTIONS` (temperature 0, `think` off)
+
+### Steps
+
+1. **`pyproject.toml`**: add `wordfreq>=3.1` to dependencies.
+2. **`config.py`**: prompt hardening, prompt-id bump, new knobs + verify cards.
+3. **New `book_harness/term_filter.py`** (wordfreq imported lazily so tests can stub):
+   - vendored `STOPWORDS` frozenset (NLTK-style, embedded — no extra dependency);
+   - `filter_chunk_terms()`: drop single-word stopwords, ≤2-char tokens, pure
+     digits/years, Roman numerals; drop phrases whose every token is a stopword;
+   - `zipf_gate()`: at aggregation, drop high-zipf single words without the
+     jargon escape hatch; phrases need one rare token (zipf < `EXTRACT_ZIPF_RARE`).
+4. **`llm_terms.py`**: filter hook after the word-length filter in
+   `extract_chunk_terms()` (log dropped count); zipf gate in `build_candidates()`
+   after scoring, before the top-N cut; new `verify_candidates()` with per-batch
+   cache keyed `(batch-terms-hash, VERIFY_PROMPT_ID)` reusing `parse_term_lines`.
+5. **`cli.py`**: wire `verify_candidates(...)` in `stage_terms` between
+   `extract_candidates`/merge and `attach_occurrences`; assist client optional there.
+6. **Tests**: `tests/test_term_filter.py` (stopword/shape/zipf; "hair" dropped at
+   freq 1 vs kept at jargon threshold; phrase rare-token rule; stubbed wordfreq);
+   extend `tests/test_llm_terms.py` (filter hook, escape hatch, verify caching +
+   graceful fallback + prompt-id invalidation).
+
+### Risks / mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Legitimate domain jargon pruned (e.g. "hair" in a dermatology book) | Jargon escape hatch (freq threshold) + LLM verification sees book-wide context |
+| wordfreq lacks a term for very new jargon | `zipf_frequency` returns 0 for unknowns → treated as rare → kept (fail-open) |
+| Additional small-model spend per run | Batches of 100 (few calls total), `verify-cache.jsonl` makes re-runs free; pass skipped when no assist client |
+| `candidates.jsonl` shrinks | Intended; knobs (`EXTRACT_ZIPF_FILTER` ↓ / `EXTRACT_JARGON_MIN_FREQ` ↑) tune the cut without code changes |

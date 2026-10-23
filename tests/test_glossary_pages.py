@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from book_harness import cli
+from book_harness import config
 from book_harness.book import Block, BlockType, PageInfo
 from book_harness.book import Book
 from book_harness.config import Settings
@@ -330,3 +331,54 @@ class TestStageTermsWiring:
         candidates = cli.stage_terms(settings, glossary_book)
         assert len(candidates) == 1
         assert candidates[0]["signal"] == "llm"     # LLM record untouched
+
+    def test_verify_pass_drops_non_technical_candidate(self, glossary_book,
+                                                       tmp_path, monkeypatch):
+        """PLAN §9 task B wiring: verification between occurrences and write."""
+        settings = Settings(ocr_file=Path("dummy.json"))
+        settings.run_root = tmp_path
+        out_dir = settings.stage_dir(stage="glossary")
+        llm = [
+            {"term": "flight dynamics", "score": 2.5, "freq": 4, "df": 3,
+             "page": 12, "signal": "llm"},
+            {"term": "hair", "score": 1.0, "freq": 1, "df": 1,
+             "page": 12, "signal": "llm"},
+        ]
+        monkeypatch.setattr(
+            cli.llm_terms_mod, "extract_candidates",
+            lambda book, client, **kw: llm,
+        )
+        monkeypatch.setattr(cli, "_extract_client", lambda s: object())
+        monkeypatch.setattr(cli.pages_mod, "find_glossary_pages",
+                            lambda book: [])
+        monkeypatch.setattr(cli, "_assist_client", lambda s: FakeAssist({
+            "flight dynamics — 4 chunks":
+                "flight dynamics: keep\nhair: drop\n",
+        }))
+
+        candidates = cli.stage_terms(settings, glossary_book)
+        assert [c["term"] for c in candidates] == ["flight dynamics"]
+        assert (out_dir / config.VERIFY_CACHE_FILE).exists()
+
+    def test_verify_skipped_without_assist_model(self, glossary_book, tmp_path,
+                                                 monkeypatch):
+        """No assist model → graceful pass-through, candidates unchanged."""
+        settings = Settings(ocr_file=Path("dummy.json"))
+        settings.run_root = tmp_path
+        out_dir = settings.stage_dir(stage="glossary")
+        llm = [{
+            "term": "flight dynamics", "score": 2.5, "freq": 4, "df": 3,
+            "page": 12, "signal": "llm",
+        }]
+        monkeypatch.setattr(
+            cli.llm_terms_mod, "extract_candidates",
+            lambda book, client, **kw: llm,
+        )
+        monkeypatch.setattr(cli, "_extract_client", lambda s: object())
+        monkeypatch.setattr(cli.pages_mod, "find_glossary_pages",
+                            lambda book: [])
+        monkeypatch.setattr(cli, "_assist_client", lambda s: None)
+
+        candidates = cli.stage_terms(settings, glossary_book)
+        assert [c["term"] for c in candidates] == ["flight dynamics"]
+        assert not (out_dir / config.VERIFY_CACHE_FILE).exists()

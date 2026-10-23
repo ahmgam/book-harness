@@ -224,7 +224,7 @@ OLLAMA_TIMEOUT = int(os.environ.get("BOOK_HARNESS_OLLAMA_TIMEOUT", "900"))
 API_DEFAULT = os.environ.get("BOOK_HARNESS_API", "auto")  # auto | ollama | openai
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-GENERATE_OPTIONS = {"temperature": 0.0, "num_ctx": 8192, "seed": 42}
+GENERATE_OPTIONS = {"temperature": 0.0, "num_ctx": 4096, "seed": 42}
 
 # ---------------------------------------------------------------------------
 # Prompt versions (bump to invalidate the chunk cache)
@@ -520,6 +520,12 @@ EXTRACT_SYSTEM = (
     "You extract vocabulary terms from text of a technical book.\n"
     "The text may contain OCR noise; read through it and identify the "
     "technical terms, methods, components and domain vocabulary it uses.\n"
+    "A term is vocabulary a specialist translator of this book would look up "
+    "in a domain dictionary: jargon, method names, component or concept "
+    "names of the book's field. Ordinary words a layperson already knows are "
+    "NOT terms — do not list them (wrong: of, the, with, house, money, "
+    "work). An everyday word qualifies only if this book clearly uses it as "
+    "domain jargon with a special meaning.\n"
     "Output is verified downstream: be precise and literal, never invent, "
     "translate or paraphrase anything.\n"
 )
@@ -538,7 +544,17 @@ EXTRACT_USER = (
     "4. Write each term exactly as it appears in the text (verbatim "
     "spelling, capitalization preserved); fix only obvious OCR typos.\n"
     "5. No bullets, numbering, or markdown formatting.\n"
-    "6. If the chunk contains no vocabulary terms, output nothing.\n"
+    "6. Technical/domain vocabulary only — no everyday English words "
+    "(function words like \"of\" or \"the\", and common general words like "
+    "\"hair\" or \"money\" are never terms).\n"
+    "7. If the chunk contains no vocabulary terms, output nothing.\n"
+    "\n"
+    "Example — for a chunk discussing flight-control software that "
+    "mentions the transport aircraft's sidewall stick, a correct reply "
+    "has exactly the lines:\n"
+    "sidewall stick\n"
+    "flight envelope\n"
+    "fly-by-wire\n"
     "\n"
     "Chunk text:\n"
     "\n"
@@ -547,7 +563,7 @@ EXTRACT_USER = (
 
 #: Prompt-card identity recorded in the extraction cache; bump when the
 #: prompt templates above change so cached replies are invalidated.
-EXTRACT_PROMPT_ID = "extract-v2"
+EXTRACT_PROMPT_ID = "extract-v3"
 
 #: Generate options for the extract model. ``think`` is disabled: the task is
 #: a short verbatim term list, not reasoning. The Ollama client hoists the
@@ -555,6 +571,85 @@ EXTRACT_PROMPT_ID = "extract-v2"
 #: (``/api/generate`` semantics); OpenAI-compatible servers ignore it
 #: (only ``OPENAI_OPTION_KEYS`` are forwarded).
 EXTRACT_GENERATE_OPTIONS = {**GENERATE_OPTIONS, "think": False}
+
+# ---------------------------------------------------------------------------
+# Technical-term focus filters (PLAN §9)
+# ---------------------------------------------------------------------------
+
+#: Zipf ceiling (``wordfreq`` scale, 0-8) above which a single-word candidate
+#: counts as everyday English rather than jargon. Real-data check: everyday
+#: words cluster ≳5.0 ("hair" 5.08, "model" 5.13, "data" 5.34, "money" 5.64)
+#: while genuine jargon sits below ~4.5 ("fuselage" 3.09, "psoriasis" 2.89);
+#: borderline academic words ("theory" 4.88, "analysis" 4.91) survive the
+#: deterministic gate and get judged contextually by the LLM verify pass.
+EXTRACT_ZIPF_FILTER = 5.0
+
+#: Zipf ceiling for the rare-token rule inside multi-word phrases: a phrase
+#: passes the commonness gate if at least one token sits below this value.
+EXTRACT_ZIPF_RARE = 4.8
+
+#: Chunk-frequency escape hatch for the zipf gate: a single word whose zipf is
+#: above ``EXTRACT_ZIPF_FILTER`` is still kept when reported by at least this
+#: many chunks — pervasive, book-wide use is the domain-jargon signal
+#: ("hair" in a dermatology book).
+EXTRACT_JARGON_MIN_FREQ = 4
+
+#: Minimum chunk frequency for a candidate to survive aggregation below the
+#: top-N cut. 1 keeps the current behavior (all chunk-reported terms).
+EXTRACT_MIN_FREQ = 1
+
+#: System card for the candidate verification pass (assist role,
+#: temperature 0): the field-agnostic expertise filter that knows whether a
+#: word is jargon *in this book*.
+VERIFY_SYSTEM = (
+    "You judge whether listed words are technical vocabulary of the book "
+    "they were extracted from.\n"
+    "A technical term is vocabulary a specialist translator would look up "
+    "in a domain dictionary: jargon, method names, component or concept "
+    "names of the book's field. Ordinary everyday words are not terms, "
+    "unless the book clearly uses them as domain jargon with a special "
+    "meaning (then they are terms).\n"
+    "Use each word's chunk frequency and the sections it appears in: a word "
+    "used pervasively across the book's sections is likely domain jargon.\n"
+    "Output is verified downstream: decide for every listed word, never "
+    "invent, translate or paraphrase anything.\n"
+)
+
+#: User-message template: one verification batch — one numbered word per
+#: line with its frequency and sections; the model answers with one word
+#: per line under the same numbering.
+VERIFY_USER = (
+    "Below is a list of vocabulary words extracted from one book. For each "
+    "word, report whether it is a technical term of this book.\n"
+    "\n"
+    "Rules:\n"
+    "1. Answer with one word per line — exactly the listed word, then\n"
+    "   \"keep\" or \"drop\" separated by a colon (example: "
+    "\"flight envelope: keep\").\n"
+    "2. Answer for every listed word, in the same order.\n"
+    "3. \"keep\": domain jargon, a method/component name, or an everyday "
+    "word clearly used with a special meaning in this book.\n"
+    "4. \"drop\": everyday vocabulary, function words, generic phrases — "
+    "words the book's field does not treat as terminology.\n"
+    "\n"
+    "Words (word: frequency in chunks | sections):\n"
+    "\n"
+    "{words}\n"
+)
+
+#: Prompt-card identity recorded in the verification cache.
+VERIFY_PROMPT_ID = "verify-v1"
+
+#: Verification replies cache file (same layout as ``extract-cache.jsonl``).
+VERIFY_CACHE_FILE = "verify-cache.jsonl"
+
+#: Candidates per verification call — keeps one call's output within a small
+#: model's safe output length.
+VERIFY_BATCH_SIZE = 100
+
+#: Generate options for the verification pass. ``think`` is disabled: the
+#: task is a short per-line verdict list, not reasoning.
+VERIFY_GENERATE_OPTIONS = {**GENERATE_OPTIONS, "think": False}
 
 #: System card for the book-glossary harvest (assist role, temperature 0).
 GLOSSARY_HARVEST_SYSTEM = (
@@ -647,10 +742,20 @@ CONSISTENCY_DECISIONS_FILE = "consistency-decisions.jsonl"
 
 
 def setup_logging(level: str = "INFO") -> None:
+    # Log through tqdm.write when progress bars are active so log lines land
+    # above the bars instead of clobbering them (book_harness.progress falls
+    # back to plain stderr when tqdm is missing).
+    try:
+        from book_harness.progress import TqdmLoggingHandler
+
+        stream_handler: logging.Handler = TqdmLoggingHandler()
+    except ImportError:                            # pragma: no cover
+        stream_handler = logging.StreamHandler()
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[stream_handler],
     )
 
 

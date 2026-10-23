@@ -67,7 +67,7 @@ Chunks are **section-aligned** (consecutive content blocks within one outline se
 | Translation | `tencent/Hy-MT2-30B-A3B` | MoE (~3B active), 33 languages incl. Arabic, Apache-2.0, official terminology prompt template |
 | Translation (light) | `google/translategemma-4b/12b/27b-it` | Gemma3-based, 55 languages |
 | Refine / verify | `Qwen/Qwen3.5-27B` or `google/gemma-4-26B-A4B-it` | General instruct model for MQM spans + A/B judging |
-| Term extraction | small instruct via Ollama (e.g. `qwen3.5:4b`) | Fully LLM-based (PLAN §8): one call per chunk, `BOOK_HARNESS_EXTRACT_MODELS` role; replies cached in `02_glossary/extract-cache.jsonl` |
+| Term extraction | small instruct via Ollama (e.g. `qwen3.5:4b`) | Fully LLM-based (PLAN §8): one call per chunk, `BOOK_HARNESS_EXTRACT_MODELS` role; replies cached in `02_glossary/extract-cache.jsonl`; technical-term focus filters (PLAN §9): stopword/word-shape rules + zipf commonness gate (`wordfreq`, config-tunable) + graceful LLM verification pass cached in `02_glossary/verify-cache.jsonl` |
 | Quality estimation | `Unbabel/wmt22-cometkiwi-da` | Reference-free QE (CC-BY-NC) |
 | Terminology DB | `arabterm.db` (SQLite) | AR/EN/FR, Wikidata + archive.org provenance built in |
 | OCR / ingest | marker (datalab) + `book.py` | Main JSON + `_meta.json` → `Book` model (flat and nested "document" OCR layouts) |
@@ -87,7 +87,8 @@ runs/<book-id>/
   00_source/          OCR JSON pair, book-summary.json, outline-repair.json
   01_profile/         domain.json, style.md, entities.jsonl
   02_glossary/        candidates.jsonl, glossary.yaml (versioned),
-                      drift-candidates.jsonl (uncertified proposals)
+                      drift-candidates.jsonl (uncertified proposals),
+                      extract-cache.jsonl, verify-cache.jsonl (PLAN §9),
   03_chunks/          chunk-0001.json (block ids, source, placeholders, hash)
   04_drafts/          chunk-0001.md + .meta.json (model, prompt, glossary ver)
                       requeued/           drafts archived when re-queued for review

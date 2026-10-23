@@ -343,3 +343,122 @@ class TestExtractCandidates:
         other.model = "other-model:0b"
         llm_terms.extract_candidates(mini_book, other, cache_path=cache)
         assert other.calls == 2   # not served from the first model's cache
+
+
+# ---------------------------------------------------------------------------
+# LLM verification pass (PLAN §9)
+# ---------------------------------------------------------------------------
+
+class FakeAssist:
+    """Canned verification replies; counts calls."""
+
+    model = "fake-assist:0b"
+
+    def __init__(self, reply: str = "", fail: bool = False) -> None:
+        self.reply = reply
+        self.fail = fail
+        self.calls = 0
+        self.last_prompt = None
+
+    def generate(self, prompt, *, system, options):
+        self.calls += 1
+        self.last_prompt = prompt
+        if self.fail:
+            raise ConnectionError("assist down")
+        return self.reply
+
+
+def _cand(term, freq=1, **extra):
+    return {"term": term, "freq": freq, "df": freq, "page": 1, "score": 1.0,
+            "signal": "llm", **extra}
+
+
+class TestParseVerdicts:
+    def test_keep_and_drop_lines(self):
+        verdicts = llm_terms.parse_verdicts(
+            "flight dynamics: keep\nhair: drop\npsoriasis: keep\n")
+        key = llm_terms._dedupe_key
+        assert verdicts == {key("flight dynamics"): True,
+                            key("hair"): False,
+                            key("psoriasis"): True}
+
+    def test_numbering_stripped(self):
+        verdicts = llm_terms.parse_verdicts(
+            "1. flight dynamics: keep\n2) hair: drop\n")
+        assert llm_terms.parse_verdicts("flight dynamics: keep") == \
+            {llm_terms._dedupe_key("flight dynamics"): True}
+        key = llm_terms._dedupe_key
+        assert verdicts[key("flight dynamics")] is True
+        assert verdicts[key("hair")] is False
+
+    def test_think_block_stripped(self):
+        reply = (_THINK_OPEN + "judging..." + _THINK_CLOSE
+                 + "\nflight dynamics: keep\n")
+        verdicts = llm_terms.parse_verdicts(reply)
+        assert verdicts == {llm_terms._dedupe_key("flight dynamics"): True}
+
+    def test_unparseable_lines_ignored(self):
+        assert llm_terms.parse_verdicts("just some prose\n") == {}
+
+
+class TestVerifyCandidates:
+    def test_empty_candidates_noop(self):
+        assert llm_terms.verify_candidates([], FakeAssist()) == []
+
+    def test_no_client_returns_input(self):
+        cands = [_cand("flight dynamics")]
+        assert llm_terms.verify_candidates(cands, None) is cands
+
+    def test_drops_verdicted_terms_keeps_unanswered(self, tmp_path):
+        cands = [_cand("flight dynamics"), _cand("hair"),
+                 _cand("never mentioned")]
+        client = FakeAssist("flight dynamics: keep\nhair: drop\n")
+        out = llm_terms.verify_candidates(
+            cands, client, cache_path=tmp_path / "verify-cache.jsonl")
+        assert [c["term"] for c in out] == ["flight dynamics",
+                                            "never mentioned"]
+
+    def test_cache_hit_skips_generate(self, tmp_path):
+        cache = tmp_path / "verify-cache.jsonl"
+        cands = [_cand("flight dynamics"), _cand("hair")]
+        first = FakeAssist("flight dynamics: keep\nhair: drop\n")
+        llm_terms.verify_candidates(cands, first, cache_path=cache)
+        assert first.calls == 1
+
+        second = FakeAssist("everything: keep\n")
+        out = llm_terms.verify_candidates(cands, second, cache_path=cache)
+        assert second.calls == 0          # served entirely from cache
+        assert [c["term"] for c in out] == ["flight dynamics"]
+
+    def test_failed_call_keeps_batch(self, tmp_path):
+        cands = [_cand("flight dynamics"), _cand("hair")]
+        client = FakeAssist(fail=True)
+        out = llm_terms.verify_candidates(
+            cands, client, cache_path=tmp_path / "verify-cache.jsonl")
+        assert out == cands               # graceful: unchanged
+
+    def test_prompt_or_model_change_invalidates_cache(self, tmp_path,
+                                                      monkeypatch):
+        cache = tmp_path / "verify-cache.jsonl"
+        cands = [_cand("flight dynamics")]
+        llm_terms.verify_candidates(cands, FakeAssist("flight dynamics: keep\n"),
+                                    cache_path=cache)
+
+        other = FakeAssist("flight dynamics: keep\n")
+        other.model = "other-assist:0b"
+        llm_terms.verify_candidates(cands, other, cache_path=cache)
+        assert other.calls == 1           # not served from the first cache
+
+        monkeypatch.setattr(config, "VERIFY_PROMPT_ID", "verify-v2")
+        third = FakeAssist("flight dynamics: keep\n")
+        llm_terms.verify_candidates(cands, third, cache_path=cache)
+        assert third.calls == 1
+
+    def test_batching(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "VERIFY_BATCH_SIZE", 2)
+        cands = [_cand(f"term {i:03d}") for i in range(5)]
+        client = FakeAssist("all: keep\n")
+        out = llm_terms.verify_candidates(
+            cands, client, cache_path=tmp_path / "verify-cache.jsonl")
+        assert client.calls == 3          # ceil(5 / 2)
+        assert len(out) == 5

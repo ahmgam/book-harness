@@ -33,6 +33,7 @@ from book_harness.config import (
     SYSTEM_PROMPT,
     TRANSLATION_MODELS,
 )
+from book_harness.progress import work_bar
 from book_harness.state import cache_key
 
 logger = logging.getLogger(__name__)
@@ -479,34 +480,40 @@ def translate_chunk(
     results: list[dict[str, Any]] = []
     started = time.time()
     prior_translation = ""
-    for unit in units:
-        # glossary restricted to terms appearing in this unit (plus the whole
-        # chunk's matched set at low volume would blow context; per-unit only)
-        pairs = match_terms(unit["text"], glossary_entries)
-        g_lines = glossary_lines(pairs)
-        context_parts = []
-        summary = summaries.summary_for(chapter)
-        if summary:
-            context_parts.append("Context so far in this section:\n" + summary)
-        if prior_translation:
-            context_parts.append("Previous paragraph translation:\n" + prior_translation)
-        context = "\n\n".join(context_parts)
-        text_out = translate_unit(
-            client, unit["text"], g_lines, context, unit.get("kind", "text"),
-            emphasis=emphasis,
-        )
-        restored = restore_placeholders(unit, text_out)
-        results.append({
-            "uid": unit["uid"],
-            "block_id": unit["block_id"],
-            "kind": unit["kind"],
-            "number": unit.get("number", ""),
-            "text": restored,
-            "raw": text_out,
-        })
-        if restored:
-            prior_translation = restored
-        summaries.note_completion(chapter, unit["text"], restored)
+
+    with work_bar(
+        units, desc=f"units in {chunk_id}", unit="unit", total=len(units)
+    ) as upbar:
+        for unit in upbar:
+            # glossary restricted to terms appearing in this unit (plus the whole
+            # chunk's matched set at low volume would blow context; per-unit only)
+            pairs = match_terms(unit["text"], glossary_entries)
+            g_lines = glossary_lines(pairs)
+            context_parts = []
+            summary = summaries.summary_for(chapter)
+            if summary:
+                context_parts.append("Context so far in this section:\n" + summary)
+            if prior_translation:
+                context_parts.append(
+                    "Previous paragraph translation:\n" + prior_translation
+                )
+            context = "\n\n".join(context_parts)
+            text_out = translate_unit(
+                client, unit["text"], g_lines, context, unit.get("kind", "text"),
+                emphasis=emphasis,
+            )
+            restored = restore_placeholders(unit, text_out)
+            results.append({
+                "uid": unit["uid"],
+                "block_id": unit["block_id"],
+                "kind": unit["kind"],
+                "number": unit.get("number", ""),
+                "text": restored,
+                "raw": text_out,
+            })
+            if restored:
+                prior_translation = restored
+            summaries.note_completion(chapter, unit["text"], restored)
 
     meta = {
         "chunk_id": chunk_id,

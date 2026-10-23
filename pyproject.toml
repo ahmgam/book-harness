@@ -9,7 +9,7 @@ description = "End-to-end pipeline for translating technical books (OCR JSON -> 
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "book-harness contributors" }]
-dependencies = ["PyYAML>=6.0"]
+dependencies = ["PyYAML>=6.0", "tqdm>=4.60", "wordfreq>=3.1"]
 
 [project.optional-dependencies]
 # Optional QE backend (cometkiwi); the LLM judge is the default otherwise.
