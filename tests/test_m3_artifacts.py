@@ -374,7 +374,9 @@ class TestTMX:
         assert first.get("tuid") == "chunk-0001/u0"
         props = {p.get("type"): p.text for p in first.findall("prop")}
         assert props["chunk"] == "chunk-0001"
-        assert props["section"] == "1 Design > 1.1 Overview"
+        assert props["section"] == "1 Design > 1.1 Overview"  # full breadcrumb
+        assert props["section-title"] == "1.1 Overview"       # leaf display title
+        assert props["section-depth"] == "2"                  # h2 ↔ hierarchy depth
         assert props["page"] == "1"
         tuvs = first.findall("tuv")
         assert tuvs[0].get("{http://www.w3.org/XML/1998/namespace}lang") == "en"
@@ -477,8 +479,10 @@ class TestTranslatedHTML:
         assert "page-break-after:always" in html and "break-after:page" in html
         # translated text lands in the right page section
         assert "الرفع يزداد مع الزاوية." in html and "التصميم" in html
-        # section headings repeat inside pages (from the section prop)
-        assert "<h2>1 &gt; Design &gt; 1.1 Overview</h2>" in html
+        # section headings repeat inside pages (from the section props): only
+        # the leaf title, tagged at the section's own hierarchy depth
+        assert "<h2>1.1 Overview</h2>" in html
+        assert "Design &gt;" not in html
 
     def test_title_defaults_to_book_prop(self, tmp_path):
         tmx = self._write_tmx(tmp_path)

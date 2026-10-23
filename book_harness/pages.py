@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 from enum import Enum
 from typing import Iterable, Optional
 
-from book_harness.book import BlockType, CHROME_TYPES
+from book_harness.book import BlockType, CHROME_TYPES, html_to_text
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +78,12 @@ _BULLET_LINE_RE = re.compile(
     r"^\s*(?:[-*•]\s|\d{1,3}[.)]\s|[أ-ي][.)]\s|\(?[a-z][.)]\s)\S"
 )
 
+#: Marker regex: a section title that names a glossary ("Glossary of Terms",
+#: "Glossary and Abbreviations", ...). The OCR does not label glossary pages
+#: itself — this relies purely on the OCR-extracted section structure
+#: (``SectionHeader`` titles and the meta ``table_of_contents``).
+_GLOSSARY_TITLE_RE = re.compile(r"\bglossary\b", re.IGNORECASE)
+
 
 def _index_like(texts: Iterable[str]) -> bool:
     blob = "\n".join(texts)
@@ -95,6 +101,80 @@ def _bullet_like(texts: Iterable[str]) -> bool:
     lines = [ln for t in texts for ln in t.splitlines() if ln.strip()]
     hits = sum(1 for ln in lines if _BULLET_LINE_RE.match(ln))
     return hits >= LIST_MIN_LINES
+
+
+#: Multi-word glossary titles stripped of folio tokens match too
+#: ("xxii Glossary" running heads surface as SectionHeaders in some OCR
+#: runs) — a leading/trailing bare decimal or lowercase-roman token is not
+#: part of the title.
+_GLOSSARY_FOLIO_TOKEN_RE = re.compile(
+    r"^\s*(?:[0-9]{1,4}|[ivxlcdm]{1,7})[.:]?\s+|\s+(?:[0-9]{1,4}|[ivxlcdm]{1,7})[.:]?\s*$"
+)
+
+
+def _glossary_header_pages(book) -> list:
+    """``SectionHeader`` blocks whose title names a glossary.
+
+    The title match is whole-word over the OCR-extracted text. A running
+    head wrongly promoted to a section header ("xxii Glossary") still
+    counts — its folio token is stripped before the check, and mid-book
+    folio inserts only ever widen the detection rather than rename sections.
+    """
+    out = []
+    for b in book.iter_content_blocks():
+        if b.type is not BlockType.SECTION_HEADER:
+            continue
+        title = html_to_text(b.title_text) or ""
+        title = _GLOSSARY_FOLIO_TOKEN_RE.sub("", title).strip()
+        if title and _GLOSSARY_TITLE_RE.search(title):
+            out.append(b)
+    return out
+
+
+def find_glossary_pages(book) -> list[range]:
+    """Locate the book's own glossary pages, if any.
+
+    Relies **only on OCR metadata** — the OCR does not tag pages as glossary,
+    but its section structure says it: a ``SectionHeader`` whose title names
+    a glossary (see :func:`_glossary_header_pages`). The section spans from
+    that block's page until just before the next header of the same or
+    higher level (deeper sub-headers such as glossary letter groups don't
+    cut it short); overlapping/adjacent results are merged.
+
+    Returns ordered, non-overlapping page ranges (empty when the book has
+    no glossary).
+    """
+    num_pages = book.num_pages
+    headers = _glossary_header_pages(book)
+    ranges: list[range] = []
+    for b in headers:
+        level = b.heading_level or 1
+        # the section ends just before the next header of the same or higher
+        # level (deeper sub-headers, e.g. glossary letter groups, don't cut
+        # it short); absent one, it runs to the end of the book
+        stop = num_pages + 1
+        for t in book.iter_content_blocks():
+            if (t.page > b.page and t.type is BlockType.SECTION_HEADER
+                    and (t.heading_level or 1) <= level):
+                stop = t.page         # first bound terminates the section
+                break
+        if stop > b.page:
+            ranges.append(range(b.page, stop))
+    return _merge_ranges(ranges)
+
+
+def _merge_ranges(ranges: list[range]) -> list[range]:
+    """Merge overlapping or adjacent ranges, ordered by start page."""
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda r: r.start)
+    merged = [ranges[0]]
+    for r in ranges[1:]:
+        if r.start <= merged[-1].stop:
+            merged[-1] = range(merged[-1].start, max(merged[-1].stop, r.stop))
+        else:
+            merged.append(r)
+    return merged
 
 
 def archetype_from_blocks(

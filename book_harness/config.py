@@ -11,6 +11,99 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# .env auto-load (before every constant below reads os.environ)
+# ---------------------------------------------------------------------------
+
+#: Path of the `.env` file that was auto-loaded, if any (diagnostics).
+DOTENV_LOADED: str | None = None
+
+
+def _dotenv_candidate() -> str | None:
+    """First existing `.env`: current working directory, then the project
+    root (the directory above ``book_harness/``)."""
+    root = Path(__file__).resolve().parent.parent
+    for cand in (Path.cwd() / ".env", root / ".env"):
+        try:
+            if cand.is_file():
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    """One ``KEY=VALUE`` line → ``(key, value)``; ``None`` for blanks,
+    comments and garbage.
+
+    Tolerates shell-style ``export KEY=…``, a trailing ``# comment`` on
+    unquoted values, and surrounding quotes. An empty value keeps the key
+    (sets it to ``""``, mirroring shell semantics), and a leading ``~`` is
+    home-expanded like ``source`` would do.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    if "=" not in line:
+        return None
+    key, _, value = line.partition("=")
+    key = key.strip()
+    value = value.strip()
+    if not key or not (key[0].isalpha() or key[0] == "_"):
+        return None
+    if len(value) >= 2 and value[0] in "\"'":
+        quote = value[0]
+        close = value.find(quote, 1)
+        value = value[1:close] if close > 0 else value[1:].strip()
+    else:
+        for idx, ch in enumerate(value):
+            if ch == "#" and (idx == 0 or value[idx - 1] in " \t"):
+                value = value[:idx].strip()
+                break
+    if value.startswith("~"):          # mirror `source`: ~ expands to the home
+        value = os.path.expanduser(value)
+    return key, value
+
+
+def load_dotenv(path: str | Path | None = None, *, override: bool = False) -> str | None:
+    """Populate ``os.environ`` from a ``KEY=VALUE`` file (no new dependency).
+
+    ``path=None`` auto-detects the run's ``.env`` (cwd first, then the
+    project root). Already-exported variables win unless ``override=True`` —
+    an explicit export beats the file, mirroring shell sourcing. Values keep
+    everything after the first ``=`` (API keys may contain ``=``); quotes
+    are stripped. Returns the loaded path or ``None``.
+    """
+    global DOTENV_LOADED
+    file = str(path) if path else _dotenv_candidate()
+    if not file:
+        return None
+    try:
+        text = Path(file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.debug(".env unreadable (%s): %s", file, exc)
+        return None
+    for raw in text.splitlines():
+        pair = _parse_dotenv_line(raw)
+        if pair is None:
+            continue
+        key, value = pair
+        if override or key not in os.environ:
+            os.environ[key] = value
+    DOTENV_LOADED = file
+    logger.debug(".env loaded: %s", file)
+    return file
+
+
+#: Module-import load point: every consumer of ``book_harness.config`` —
+#: CLI, MCP server, library imports — has its ``.env`` applied before the
+#: constants below are resolved.
+DOTENV_LOADED = load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Artifact layout (PLAN.md §4)
 # ---------------------------------------------------------------------------
@@ -66,6 +159,7 @@ TARGET = "ar"
 #: * ``BOOK_HARNESS_ASSIST_MODELS`` / ``BOOK_HARNESS_ASSIST_MODEL``
 #: * ``BOOK_HARNESS_QE_MODELS`` / ``BOOK_HARNESS_QE_MODEL``
 #: * ``BOOK_HARNESS_FORMAT_MODELS`` / ``BOOK_HARNESS_FORMAT_MODEL``
+#: * ``BOOK_HARNESS_EXTRACT_MODELS`` / ``BOOK_HARNESS_EXTRACT_MODEL``
 #:
 #: Values: whitespace- or comma-separated Ollama names / server model IDs,
 #: e.g. ``BOOK_HARNESS_TRANSLATION_MODELS="hy-mt2-30b-a3b, qwen2.5:14b"``.
@@ -97,8 +191,7 @@ QE_MODELS = _env_models("BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", ASSIS
 #: the translation list — a dedicated MT model should never be reused for
 #: the layout-writing pass.
 _FORMAT_MODEL_DEFAULTS = [
-    "qwen3.8",                      # 27B general instruct
-    "gemma4",                       # 26B general instruct
+    "gemma4:26b",                   # 26B general instruct
     "k2-horizon",                   # 36B general instruct
     "qwen2.5:14b", "llama3.1:8b",   # generic instruct fallbacks
 ]
@@ -106,6 +199,20 @@ FORMAT_MODELS = _env_models(
     "BOOK_HARNESS_FORMAT_MODELS",
     "BOOK_HARNESS_FORMAT_MODEL",
     _FORMAT_MODEL_DEFAULTS,
+)
+
+#: Term-extraction role: the small instruct model that reads the book chunk by
+#: chunk and lists the glossary terms itself (v2 extraction, PLAN §8). Small
+#: models are fine — the output is a short term list, and the task runs once
+#: per chunk. Never honours the MT ``--model`` override.
+_EXTRACT_MODEL_DEFAULTS = [
+    "qwen3.5:4b",
+    "qwen2.5:3b-instruct", "llama3.2:3b", "qwen2.5:7b",
+]
+EXTRACT_MODELS = _env_models(
+    "BOOK_HARNESS_EXTRACT_MODELS",
+    "BOOK_HARNESS_EXTRACT_MODEL",
+    _EXTRACT_MODEL_DEFAULTS,
 )
 
 #: Default serving backend is Ollama (native ``/api/generate``). A host URL
@@ -361,7 +468,182 @@ DEFAULT_DOMAINS = ("aerospace", "software")
 STATE_FILE = "state.json"
 GLOSSARY_FILE = "glossary.yaml"
 CANDIDATES_FILE = "candidates.jsonl"
+GLOSSARY_PAGE_TERMS_FILE = "glossary-page-terms.jsonl"
+
+#: Extraction-reply cache (LLM extraction v2, PLAN §8): one line per chunk
+#: call, keyed by chunk source hash + model + prompt id; re-runs skip paid calls.
+EXTRACT_CACHE_FILE = "extract-cache.jsonl"
 STATE_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# Book-glossary harvesting (task 6.2/6.3)
+# ---------------------------------------------------------------------------
+
+#: Fixed score for terms harvested from the book's own glossary pages.
+#: The author curated this list, so it outranks every mined/NER signal
+#: (n-gram scores average ≲ 3; GLiNER-only finds use 8.0).
+GLOSSARY_PAGE_SCORE = 10.0
+
+#: Candidate record signal for book-glossary harvests; mixed into
+#: ``candidates.jsonl`` additively (deduped, no re-scoring of mined terms).
+GLOSSARY_PAGE_SIGNAL = "book-glossary"
+
+#: Reject model replies whose "term" lines exceed this many characters —
+#: they are definitions or sentences, not terms.
+GLOSSARY_MAX_TERM_CHARS = 60
+
+# ---------------------------------------------------------------------------
+# Term extraction v2 (fully LLM-based; PLAN §8)
+# ---------------------------------------------------------------------------
+
+#: Candidate record signal for LLM chunk extraction — the only extraction
+#: signal; mixed with ``book-glossary`` harvest records additively.
+EXTRACT_SIGNAL = "llm"
+
+#: Candidate score from chunk frequency: ``EXTRACT_SCORE_BASE +
+#: EXTRACT_SCORE_STEP * (freq_in_chunks - 1)``. A term reported by exactly one
+#: chunk scores 1.0 and ranks below book-glossary records
+#: (``GLOSSARY_PAGE_SCORE`` = 10.0).
+EXTRACT_SCORE_BASE = 1.0
+EXTRACT_SCORE_STEP = 0.25
+
+#: Default candidate cap for the LLM extraction (same as v1).
+EXTRACT_MAX_CANDIDATES = 400
+
+#: Maximum number of words an extracted term may span — terms, not phrases:
+#: "biopsy" and "excisional biopsy" are fine, a 4+ word run is a phrase and
+#: gets rejected (prompt rule + hard post-parse filter).
+EXTRACT_MAX_TERM_WORDS = 3
+
+#: System card for the chunk term extraction (extract role, temperature 0).
+EXTRACT_SYSTEM = (
+    "You extract vocabulary terms from text of a technical book.\n"
+    "The text may contain OCR noise; read through it and identify the "
+    "technical terms, methods, components and domain vocabulary it uses.\n"
+    "Output is verified downstream: be precise and literal, never invent, "
+    "translate or paraphrase anything.\n"
+)
+
+#: User-message template: one chunk's section title + placeholder-protected text.
+EXTRACT_USER = (
+    "The following text was OCR-extracted from one chunk of a technical "
+    "book (section: {section}). List the vocabulary terms it contains.\n"
+    "\n"
+    "Rules:\n"
+    "1. One term per line — nothing else on the line.\n"
+    "2. Terms must be at most {max_words} words long (1 to {max_words} "
+    "words). Never extract a longer phrase or a full heading.\n"
+    "3. Terms only: no definitions, explanations, translations, or "
+    "annotations.\n"
+    "4. Write each term exactly as it appears in the text (verbatim "
+    "spelling, capitalization preserved); fix only obvious OCR typos.\n"
+    "5. No bullets, numbering, or markdown formatting.\n"
+    "6. If the chunk contains no vocabulary terms, output nothing.\n"
+    "\n"
+    "Chunk text:\n"
+    "\n"
+    "{text}\n"
+)
+
+#: Prompt-card identity recorded in the extraction cache; bump when the
+#: prompt templates above change so cached replies are invalidated.
+EXTRACT_PROMPT_ID = "extract-v2"
+
+#: Generate options for the extract model. ``think`` is disabled: the task is
+#: a short verbatim term list, not reasoning. The Ollama client hoists the
+#: ``think`` key out of ``options`` into the request top level
+#: (``/api/generate`` semantics); OpenAI-compatible servers ignore it
+#: (only ``OPENAI_OPTION_KEYS`` are forwarded).
+EXTRACT_GENERATE_OPTIONS = {**GENERATE_OPTIONS, "think": False}
+
+#: System card for the book-glossary harvest (assist role, temperature 0).
+GLOSSARY_HARVEST_SYSTEM = (
+    "You extract vocabulary terms from one page of a technical book's own "
+    "glossary section.\n"
+    "The text may contain OCR noise; read through it and list the terms it "
+    "defines.\n"
+    "Output is verified downstream: be precise and literal, never invent, "
+    "translate or paraphrase anything.\n"
+)
+
+#: User-message template: the OCR text of one glossary page only.
+GLOSSARY_HARVEST_USER = (
+    "The following text was OCR-extracted from one page of a book's own "
+    "glossary section. List the vocabulary terms it contains.\n"
+    "\n"
+    "Rules:\n"
+    "1. One term per line — nothing else on the line.\n"
+    "2. Terms only: no definitions, explanations, translations, or "
+    "annotations.\n"
+    "3. Write each term exactly as it appears on the page (verbatim "
+    "spelling, capitalization preserved); fix only obvious OCR typos.\n"
+    "4. No bullets, numbering, or markdown formatting.\n"
+    "5. If the page contains no glossary entries, output nothing.\n"
+    "\n"
+    "Glossary page text:\n"
+    "\n"
+    "{text}\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Occurrence capture + translation selection (context-informed glossary)
+# ---------------------------------------------------------------------------
+
+#: Per-match context window: characters kept on each side of a found term
+#: when documenting its occurrences in ``candidates.jsonl`` (record field
+#: ``occurrences``) and replayed to the select model.
+OCCURRENCE_CONTEXT_CHARS = 150
+
+#: Cap on documented occurrences per term — keeps the selection prompt
+#: bounded for terms that saturate a book (e.g. "software").
+OCCURRENCES_MAX_PER_TERM = 8
+
+#: System card for the glossary consistency stage (assist role, temperature
+#: 0): pick among certified atomic dictionary renderings using the book's own
+#: usage, traced to the chunks the term occurs in.
+CONSISTENCY_SYSTEM = (
+    "You choose which certified Arabic translation fits an English technical "
+    "term as it is used in a book.\n"
+    "Several terminology dictionaries certify different Arabic renderings; "
+    "the occurrences show — with chunk references — how the book actually "
+    "uses the term.\n"
+    "Ground decisions in the supplied occurrences, not prior preference.\n"
+)
+
+#: User-message template: term, numbered dictionary options, then documented
+#: occurrences (chunk id + section + page + context window). The model
+#: replies with the chosen option number only.
+CONSISTENCY_USER = (
+    "English technical term: {term}\n"
+    "Book domain: {domains}\n"
+    "\n"
+    "Certified Arabic translations from terminology dictionaries:\n"
+    "{options}\n"
+    "\n"
+    "Chunks of this book where the term occurs (with surrounding context):\n"
+    "{occurrences}\n"
+    "\n"
+    "Which translation best fits the term's usage in these chunks?\n"
+    "Reply with the number of the chosen translation only."
+)
+
+#: Prompt-card identity recorded in the consistency cache; bump when the
+#: prompt templates above change so cached decisions are invalidated.
+CONSISTENCY_PROMPT_ID = "consistency-v1"
+
+#: Generate options for the consistency model. ``think`` is disabled like the
+#: extraction card: the task is picking a numbered option, not reasoning.
+CONSISTENCY_GENERATE_OPTIONS = {**GENERATE_OPTIONS, "think": False}
+
+#: Consistency decision cache: one line per decided term, keyed by term +
+#: options hash + model + prompt id; re-runs replay decisions without
+#: paying for the same model call twice.
+CONSISTENCY_CACHE_FILE = "consistency-cache.jsonl"
+
+#: Auditable decision log of the consistency stage: one line per decided
+#: term (term, options presented, choice, and how it was reached).
+CONSISTENCY_DECISIONS_FILE = "consistency-decisions.jsonl"
 
 
 def setup_logging(level: str = "INFO") -> None:

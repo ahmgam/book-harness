@@ -50,6 +50,29 @@ def chunk_dicts(chunks: list[Any]) -> list[dict[str, Any]]:
     return [c.to_dict() if not isinstance(c, dict) else c for c in chunks]
 
 
+def leaf_section(chunk: dict[str, Any]) -> tuple[str, int]:
+    """Display heading for a chunk's section: ``(label, depth)`` (1-based).
+
+    A chunk's breadcrumb (``section_path``, root→leaf) describes the full
+    hierarchy; the heading shows only the leaf's own section title, wrapped
+    in a heading tag matching the depth the section sits at.  Falls back to
+    taking the last ``>``-separated part of the legacy ``section_title``
+    string when the breadcrumb is missing (or is "(front matter)").
+    """
+    path = [s for s in (chunk.get("section_path") or [])
+            if str(s.get("title") or "").strip()]
+    if path:
+        leaf = path[-1]
+        parts = (leaf.get("number"), leaf.get("title"))
+        label = " ".join(str(p) for p in parts if str(p or "").strip()).strip()
+        return label or "(section)", min(max(len(path), 1), 6)
+    raw = str(chunk.get("section_title") or "").strip()
+    parts = [p.strip() for p in raw.split(">") if p.strip()]
+    if parts:
+        return parts[-1], min(max(len(parts), 1), 6)
+    return "(front matter)", 1
+
+
 # ---------------------------------------------------------------------------
 # 3.1 Glossary appendix
 # ---------------------------------------------------------------------------
@@ -160,7 +183,7 @@ _BILINGUAL_CSS = """\
 body{font-family:Georgia,'Times New Roman',serif;margin:2rem auto;max-width:70rem;padding:0 1rem;color:#222}
 h1{font-size:1.6rem}
 .section{margin:2.5rem 0 1.5rem;border-bottom:2px solid #bbb;padding-bottom:.3rem}
-.section h2{margin:0;font-size:1.15rem}
+.section h1,.section h2,.section h3,.section h4,.section h5,.section h6{margin:0;font-size:1.15rem}
 .section .meta{color:#777;font-size:.85rem;margin-top:.2rem}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:0 2rem;border-bottom:1px solid #eee;padding:.45rem 0}
 .row img{max-width:100%}
@@ -211,10 +234,11 @@ def render_bilingual_html(
     last_page: int | None = None
     for chunk in chunks:
         dict_units = {u["uid"]: u for u in chunk.get("units", [])}
-        section = chunk.get("section_title") or "(section)"
+        section, depth = leaf_section(chunk)
+        heading_tag = f"h{min(depth, 6)}"
         parts.append(
             f'<section class="section" id="{_xml.escape(chunk["chunk_id"])}">'
-            f"<h2>{_xml.escape(section)}</h2>"
+            f"<{heading_tag}>{_xml.escape(section)}</{heading_tag}>"
             f"<div class='meta'>{_xml.escape(chunk['chunk_id'])}"
             + (f" · pages {chunk.get('pages')}" if chunk.get("pages") else "")
             + "</div></section>"
@@ -485,6 +509,7 @@ body{margin:0;background:#fff;color:#111;direction:rtl;text-align:right;
 h1{font-size:1.5rem;text-align:center;margin:0 0 1.5rem}
 h2{font-size:1.05rem;color:#333;border-bottom:1px solid #ddd;padding-bottom:.2rem;margin:1.2rem 0 .6rem}
 h3{font-size:.95rem;color:#444;margin:.9rem 0 .3rem}
+h4,h5,h6{font-size:.9rem;color:#555;margin:.8rem 0 .3rem}
 p{margin:.35rem 0;text-align:justify;hyphens:none}
 p.title{font-weight:700;font-size:1.05rem}
 p.caption{font-size:.92rem;color:#555;text-align:center}
@@ -514,6 +539,17 @@ p.caption{font-size:.92rem;color:#555;text-align:center}
   .page{padding:0;max-width:none;margin:0}
 }
 """
+
+
+def _section_depth_prop(raw: str | None) -> int | None:
+    """Parsed ``section-depth`` prop, ``None`` when absent/garbage/out of 1..6."""
+    if not raw:
+        return None
+    try:
+        depth = int(raw)
+    except ValueError:
+        return None
+    return depth if 1 <= depth <= 6 else None
 
 
 def render_translated_html(
@@ -558,7 +594,8 @@ def render_translated_html(
             continue
         units.append({
             "page": last_page,
-            "section": props.get("section") or "",
+            "section": props.get("section-title") or props.get("section") or "",
+            "depth": _section_depth_prop(props.get("section-depth")),
             "kind": (props.get("kind") or "text").lower(),
             "blocktype": props.get("blocktype") or "",
             "chunk": props.get("chunk") or "",
@@ -594,11 +631,13 @@ def render_translated_html(
             f"<header><span>{_xml.escape(label)}</span>"
             f"<span>{pos} / {total}</span></header>"
         )
-        last_section: str | None = None
+        last_section: tuple[str, int | None] | None = None
         for u in group:
-            if u["section"] and u["section"] != last_section:
-                last_section = u["section"]
-                parts.append(f"<h2>{_xml.escape(u['section'])}</h2>")
+            heading = (u["section"], u.get("depth"))
+            if u["section"] and heading != last_section:
+                last_section = heading
+                tag = f"h{min(u.get('depth') or 2, 6)}"
+                parts.append(f"<{tag}>{_xml.escape(u['section'])}</{tag}>")
             if u["kind"] == "passthrough":
                 html = (u["text"] or "").rstrip()
                 if "figure" in u["blocktype"].lower():
@@ -692,6 +731,8 @@ def render_tmx(
         def _section() -> str:
             return chunk.get("section_title", "")
 
+        section_label, section_depth = leaf_section(chunk)
+
         seen_units: set[str] = set()
 
         def _unit(uid: str, ref: dict[str, Any] | None) -> None:
@@ -708,6 +749,8 @@ def render_tmx(
                 "kind": unit.get("kind", "text"),
                 "chunk_id": chunk["chunk_id"],
                 "section": _section(),
+                "section_label": section_label,
+                "section_depth": section_depth,
                 "uid": uid,
                 "page": _page(ref),
                 "src": _restore(unit),
@@ -731,6 +774,8 @@ def render_tmx(
                         "blocktype": block.type.value,
                         "chunk_id": chunk["chunk_id"],
                         "section": _section(),
+                        "section_label": section_label,
+                        "section_depth": section_depth,
                         "uid": ref["block_id"].lstrip("/"),
                         "page": _page(ref),
                         "src": "",
@@ -767,6 +812,11 @@ def render_tmx(
             )
         if p["section"]:
             block.append(f'      <prop type="section">{_xml.escape(p["section"])}</prop>')
+        if p.get("section_label"):
+            block.append(
+                f'      <prop type="section-title">{_xml.escape(p["section_label"])}</prop>'
+            )
+            block.append(f'      <prop type="section-depth">{p.get("section_depth", 1)}</prop>')
         if p["page"] is not None:
             block.append(f'      <prop type="page">{p["page"]}</prop>')
         block.append(f'      <prop type="chunk">{_xml.escape(p["chunk_id"])}</prop>')

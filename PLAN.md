@@ -24,12 +24,14 @@ book-harness/
     config.py            # paths, model names, prompt versions, policies
     book.py              # (exists) OCR JSON pair → Book model
     profile.py           # Phase 0: domain, style, entity profiling
-    terms.py             # term extraction: GLiNER + n-gram mining + LLM adjudication
+    terms.py             # tokenisation support + candidates.jsonl writer (drift.py shares the constants)
+    llm_terms.py         # term extraction v2: small instruct model, one call per chunk (PLAN §8)
     glossary.py          # arabterm lookup, conflict policy, glossary.yaml writer
     chunker.py           # section-aligned chunking + inline placeholders
     translate.py         # Ollama/vLLM client, glossary injection, rolling context
+    consistency.py       # consistency stage: one rendering per term (post-glossary LLM adjudication)
     refine.py            # estimate → patch → verify loop
-    qa.py                # QE scoring, compliance audit, consistency audit
+    qa.py                # QE scoring, compliance audit, drift audit (consistency audit)
     assemble.py          # markdown/HTML output, glossary appendix, manifest
     normalize.py         # Arabic text normalization (shared by enforcement + QA)
     state.py             # run state.json, resume logic, cache keys
@@ -244,6 +246,75 @@ to the in-pipeline stage (idempotency confirmed).
 | Cost blowup across 500+ pages | `needs_format()` gate (5.3); assist-family models only (5.2) |
 | LLM destructively repairs tables | Deterministic pipe-table repair preferred; LLM only when repair fails (5.2 table card) |
 
+### M6 — Book-glossary harvesting (glossary pages → vocabulary candidates)
+
+> If the source book already contains its own glossary (back-matter
+> "Glossary" pages), those pages are a high-precision vocabulary list the
+> author curated. Detect them, hand them to the assist model to extract the
+> vocabulary terms listed on each page, and mix the resulting candidates into
+> the normal vocabulary-extraction output before the glossary builder runs.
+> The rest of the pipeline proceeds unchanged.
+
+**Design decisions:**
+
+1. **Detection is purely OCR metadata.** The OCR does not tag pages as
+   glossary (no such block type or page category in the OCR contract), but
+   its section structure does: a `SectionHeader` whose title names a
+   glossary (whole-word match; a folio token from running heads such as
+   "xxii Glossary" is stripped before matching, since OCR sometimes
+   promotes running heads into headers). The section spans from that
+   block's page until just before the next header of the same-or-higher
+   level; overlapping/adjacent spans merge. No text-shape heuristics: a
+   book without a glossary header yields no harvest (deliberate — a
+   metadata-only contract is deterministic and explains itself).
+2. **Extraction via the assist model, fail-fast.** Each glossary page's text
+   is sent to the assist role (`_assist_client(settings)`, temperature 0 via
+   `config.GENERATE_OPTIONS`) with a prompt asking for one term per line,
+   verbatim, definitions omitted. If glossary pages were detected and the
+   assist client cannot be built or any page call fails/timeouts, the `terms`
+   stage raises and the pipeline stops (state.json records it; a re-run
+   retries the stage). No silent degradation.
+3. **Purely additive merge, no re-scoring.** After `terms.extract_candidates`
+   finishes, the glossary-page term records
+   (`{term, freq: 1, df: <glossary pages>, page: <glossary page>,
+   score: GLOSSARY_PAGE_SCORE, signal: "book-glossary"}`) are appended and
+   deduped against mined candidates on the NFKC-lower key (`terms.py`
+   convention). Mined candidates are never re-scored.
+4. **Everything downstream is unchanged.** The merged list goes into
+   `candidates.jsonl`, so `GlossaryBuilder.build()`, arabterm lookup,
+   conflict policy, LLM tie-break, `glossary.yaml` versioning, per-chunk
+   cache keys, translation injection, and QA compliance all run normally on
+   the union. Glossary pages are not assumed to carry Arabic equivalents —
+   the standard lookup flow applies to these terms.
+5. **Provenance artifact.** The raw glossary-page harvest is written separately
+   (`02_glossary/glossary-page-terms.jsonl`, mirroring
+   `drift-candidates.jsonl`) before the merge, and detection info lands in
+   `state.json` / the source summary (`book_glossary_pages`, `page_terms`).
+
+**Tasks:**
+
+| # | Task | Details | Depends on |
+|---|---|---|---|
+| 6.1 | Glossary-page detector | `pages.py`: `_GLOSSARY_TITLE_RE` (whole-word `glossary`) folio-token stripper + `_GLOSSARY_FOLIO_TOKEN_RE`, new public `find_glossary_pages(book) -> list[range]` (ordered, merged contiguous ranges); unit tests: header span bounds, letter-group subheaders don't cut short, whole-word only, folio running heads, empty result | — |
+| 6.2 | Page-term extraction | New `book_harness/glossary_pages.py`: `extract_page_terms(book, page_ranges, assist_client)` — page text via `book.iter_content_blocks(pages=...)`, one assist-model call per page (batchable), line parser (strip bullets/numbering, NFKC-lower dedupe), candidate-record builder; fail-fast on missing client / failed call | 6.1 |
+| 6.3 | Stage wiring + config | `config.py`: `GLOSSARY_PAGE_TERMS_FILE`, `GLOSSARY_PAGE_SCORE`, `GLOSSARY_PAGE_SIGNAL`, `GLOSSARY_MAX_TERM_CHARS`, harvest prompt cards; `cli.stage_terms`: run detection → extraction → merge (dedupe) → write `candidates.jsonl` with the union + `glossary-page-terms.jsonl`; state/summary logging (`book_glossary_pages`, `page_terms`); no-op path when no pages detected | 6.2 |
+| 6.4 | Validation run | Flight Simulation book: detector finds the front-matter Glossary (pages 16–19); assist-model spike harvests 145 terms with per-page call audit; full unit suite green | 6.3 |
+
+**Exit criteria:** books without glossary pages take the untouched path (zero
+behavior change); a book with a glossary yields page-extracted terms mixed
+into `candidates.jsonl` with `signal: "book-glossary"`, all flowing through
+the standard glossary build; missing/broken assist model stops the run
+instead of silently dropping the harvest.
+
+**Risks / mitigations:**
+
+| Risk | Mitigation |
+|---|---|
+| OCR promotes running heads ("xxii Glossary") into SectionHeaders | Folio tokens stripped before title matching (6.1); validated on the Flight Simulation book |
+| Assist model lists definitions instead of terms | Prompt fixes output shape (one term per line); parser rejects lines over `GLOSSARY_MAX_TERM_CHARS` |
+| LLM output drift (paraphrased terms) | Verbatim-terms prompt at temperature 0; provenance artifact (6.3) makes review possible |
+| OCR mashes several entries onto one line | The assist model reads the whole page and splits terms; per-page calls, not per-entry parsing |
+
 ---
 
 ## 3. Model & infrastructure decisions
@@ -271,7 +342,7 @@ to the in-pipeline stage (idempotency confirmed).
 runs/<book-id>/
   00_source/          OCR JSON pair (main + _meta), consolidated Book model, extracted images
   01_profile/         domain.json, style.md, entities.jsonl
-  02_glossary/        candidates.jsonl, glossary.yaml (versioned), audit.md
+  02_glossary/        candidates.jsonl (mined + book-glossary harvest), glossary-page-terms.jsonl (M6 provenance), glossary.yaml (versioned), audit.md
   03_chunks/          chunk-0001.json (block ids, source, placeholders, hash)
   04_drafts/          chunk-0001.md + .meta.json (model, prompt, glossary ver)
   05_refine/          chunk-0001.spans.json, patches.jsonl, verdicts.jsonl
@@ -299,6 +370,7 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 | 5 | **Uncertified terms degrade the glossary silently.** Scientific books always contain terms no dictionary covers. | Explicit uncertified-term policy: transliteration, keep-English-in-parentheses, or LLM coinage — all flagged `uncertified` for human review, never silently mixed in. | 1.6, 3.6 |
 | 6 | **Arabic morphology breaks naive enforcement.** Prefixes/suffixes (ال، و، ب، ات، ين…) make literal string matching produce false violations and false compliance. | Shared Arabic normalizer (strip diacritics, unify alef/ya/ta-marbuta) + stem-aware matching (CAMeL Tools), used by both enforcement and the compliance audit. | 1.3, 2.4 |
 | 7 | **The glossary drifts after translation starts.** Drafting reveals terms extraction missed. | Glossary freeze point (versioned artifact) before translation + one drift loop: mine the draft for new recurring terms → append as `uncertified` → human confirms → re-run only affected chunks. | 3.6 |
+| 8 | **The book may already have its own glossary pages.** The author's own back-matter glossary is a curated, high-precision vocabulary list that naive n-gram mining overlooks as a signal. | Detect glossary pages from OCR metadata (whole-word glossary `SectionHeader` titles, folio-stripped), hand them to the assist model to list the terms on each page, and merge those candidates additively into `candidates.jsonl` (dedupe, signal `book-glossary`) before the glossary builder runs; fail-fast if the assist model is unavailable while glossary pages exist. | M6 (6.1–6.4) |
 
 ### Translation phase
 
@@ -349,3 +421,65 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 3. Download arabterm.db and build the loader + domain mapping (1.4).
 4. Run the GLiNER extraction spike on 3 chapters (1.5 spike).
 5. Verify Hy-MT2-30B-A3B GGUF availability (§3 checklist).
+
+---
+
+## 8. Refactor: fully LLM-based glossary extraction (2026-10-20)
+
+> Supersedes §1.5's deterministic extraction. The `terms` stage becomes LLM-driven:
+> the book is chunked with the **existing chunker** and every chunk is sent to a
+> **small instruct model** (selected via `BOOK_HARNESS_EXTRACT_MODELS`, e.g.
+> `qwen3.5:4b`) which extracts the glossary terms itself. Nothing downstream
+> (arabterm glossary build, translation, QA, drift, artifacts) changes.
+
+### Design decisions
+
+| Decision | Choice |
+|---|---|
+| Old signals | Both removed (n-gram mining + GLiNER) |
+| Model selection | New role env `BOOK_HARNESS_EXTRACT_MODELS` / `BOOK_HARNESS_EXTRACT_MODEL` |
+| Chunking | Reuse `chunker.plan_chunks()` inside the terms stage (in memory, not written to `03_chunks`) |
+| Book-glossary harvest | Kept (`glossary_pages.py`); merged additively as today |
+| Contract | Fail-loud: no model reachable → the terms stage stops (no silent n-gram fallback) |
+
+### Steps
+
+1. **`config.py`**: new `EXTRACT_MODELS` role (via `_env_models`, defaults
+   `["qwen3.5:4b", "qwen2.5:3b-instruct", "llama3.2:3b", "qwen2.5:7b"]`),
+   `EXTRACT_SIGNAL = "llm"`, scoring constants
+   (`score = 1.0 + 0.25 * (freq_in_chunks - 1)`), word limit
+   `EXTRACT_MAX_TERM_WORDS = 3` (terms, not phrases — enforced in the
+   prompt **and** as a hard post-parse filter), and prompt cards
+   `EXTRACT_SYSTEM` / `EXTRACT_USER` (`{section}` + `{text}`).
+   The extract role also disables thinking (`EXTRACT_GENERATE_OPTIONS`
+   with `think: false`; the Ollama client hoists `think` to the request top level).
+2. **New module `book_harness/llm_terms.py`** (blueprint: `glossary_pages.py`):
+   - `chunk_texts()` — `plan_chunks` → `(first_page, pages, section_title, text)`
+     with `text = "\n".join(u.text for u in chunk.units)`.
+   - `strip_think()` — removes `<think>…</think>` from reasoning models.
+   - `extract_chunk_terms()` — one `generate()` per chunk → `parse_term_lines()`.
+   - `build_candidates()` — candidate schema `{term, freq, df, page, score, signal="llm"}`,
+     freq/df = number of reporting chunks, page = first chunk's min page, sorted `(-freq, term)`, capped.
+   - `extract_candidates()` — orchestrator; exceptions → `RuntimeError`; empty replies on
+     content chunks accepted (logged).
+   - Reply cache `02_glossary/extract-cache.jsonl` keyed by
+     `(chunk source_hash, model, prompt id)` so re-runs skip paid calls.
+3. **Slim `terms.py`**: keep `RUBBER_WORDS` / `_WORD_RE` (imported by `drift.py`)
+   and `write_candidates`; delete `mine_ngrams`, `GlinerExtractor`, `extract_candidates`.
+4. **`cli.py`**: `_extract_client()` (never honours the MT `--model` override);
+   `stage_terms` calls `llm_terms.extract_candidates(...)` then merges the
+   book-glossary harvest as before; log line reflects the extract model.
+5. **Cleanup**: remove the `gliner` pip extra, `.env.example` + `README.md` mention
+   the new role; historical `PLAN.md` §1.5 / `brainstorming.md` stay as-is.
+6. **Tests**: new `tests/test_llm_terms.py` (per-chunk calls, think-strip,
+   aggregation, dedupe, cap, fail-loud, cache); update the `stage_terms` wiring
+   test in `tests/test_glossary_pages.py`; `test_drift.py` stays green untouched.
+
+### Risks / side effects
+
+- **Glossary version churn**: new candidates → new `glossary.yaml` version → all
+  chunk draft cache keys invalidate once after this refactor (by design).
+- **Small-model quality**: temperature 0 + verbatim rule + char-capped parsing +
+  arabterm certification filter downstream; drift mining still catches remnants.
+- **Runtime**: ~1 LLM call per chunk (~1200 chars in, short output), bounded by
+  the extraction cache on re-runs.

@@ -63,9 +63,9 @@ REQUEUED_DIR = "requeued"
 
 #: Stage display order (mirrors cli.STAGES; kept local to avoid a cycle).
 STAGE_ORDER = [
-    "source", "outline-repair", "terms", "glossary", "chunk", "gate",
-    "translate", "qe", "refine", "compliance", "consistency", "drift",
-    "artifacts", "assemble",
+    "source", "outline-repair", "terms", "glossary", "consistency", "chunk",
+    "gate", "translate", "qe", "refine", "compliance", "drift-audit",
+    "drift", "artifacts", "assemble",
 ]
 
 _TERM_NORM_RE = re.compile(r"[_\-/]+")

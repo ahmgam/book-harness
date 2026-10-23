@@ -69,6 +69,132 @@ class BlockType(str, Enum):
 CHROME_TYPES = frozenset({BlockType.PAGE_HEADER, BlockType.PAGE_FOOTER})
 
 
+# --------------------------------------------------------------------------
+# Nested document format (marker's "children" tree)
+# --------------------------------------------------------------------------
+
+#: Structural children whose markup already lives in their parent group
+#: (table cells of a rendered ``<table>``, list items inlined by the group).
+_NESTED_STRUCTURAL_CHILD_TYPES = frozenset({"TableCell", "ListItem"})
+
+_CONTENT_REF_RE = re.compile(
+    r"<content-ref[^>]*\bsrc=['\"]([^'\"]+)['\"][^>]*>\s*(?:.*?)\s*</content-ref>"
+)
+
+
+def _iter_nested_tree(node: dict) -> Iterator[dict]:
+    """Pre-order walk of a nested document-format block tree (yields nodes)."""
+    for child in node.get("children") or []:
+        yield child
+        yield from _iter_nested_tree(child)
+
+
+def _resolve_content_refs(html: str, by_id: dict[str, dict],
+                          owner: dict, seen: set[str] | None = None) -> str:
+    """Inline ``<content-ref src='id'>`` pointers with the target's html.
+
+    Images carried by the referenced blocks are merged into ``owner``
+    ("images" map), because in the nested format only the leaf blocks hold
+    the base64 data while only the referencing block survives flattening.
+    """
+    if seen is None:
+        seen = set()
+
+    def repl(match: re.Match) -> str:
+        target_id = match.group(1)
+        if target_id in seen or target_id not in by_id:
+            return ""
+        seen.add(target_id)
+        target = by_id[target_id]
+        if target.get("images"):
+            merged = dict(owner.get("images") or {})
+            merged.update(target["images"])
+            owner["images"] = merged
+        return _resolve_content_refs(target.get("html") or "", by_id, owner, seen)
+
+    return _CONTENT_REF_RE.sub(repl, html)
+
+
+def _flatten_marker_nested(root: dict) -> tuple[list[dict], dict[int, dict]]:
+    """Convert marker's nested "document format" to the flat block list.
+
+    In the nested format every container references its children through
+    ``<content-ref>`` pointers in its html: ``Page`` nodes reference their
+    content blocks, group blocks (``PictureGroup``, ``ListGroup``, ...)
+    reference theirs, while ``Table``/``Form``/``TableOfContents`` already
+    carry the full markup (their ``TableCell`` children are unreferenced).
+
+    The flat format instead stores merged html and no ``Page`` blocks at
+    all — pages are implied by the ``/page/N/`` block-id prefixes and
+    described by ``page_info``. Conversion, page by page in reading order:
+
+    * ``Page`` containers are geometry only; their children become the
+      flat blocks of that page.
+    * A child that its parent's html references is inlined there (markup
+      via :func:`_resolve_content_refs`, images merged) and not emitted
+      as its own block.
+    * Table/list-structural children not referenced by the parent are
+      dropped as duplicates of the parent's markup.
+    """
+    by_id: dict[str, dict] = {}
+    for node in _iter_nested_tree(root):
+        if node.get("id"):
+            by_id[node["id"]] = node
+
+    blocks: list[dict] = []
+    page_info: dict[int, dict] = {}
+
+    def walk(container: dict, inlined: bool = False) -> None:
+        """Emit the content children of ``container`` in reading order.
+
+        ``inlined`` means the container itself is a real content block whose
+        html already carries its referenced children (flattened above) — so
+        those must not be emitted again. A ``Page``/``Document`` container's
+        ref pointers are pure structure and ignored for emission decisions.
+        """
+        html = container.get("html") or ""
+        for child in container.get("children") or []:
+            ctype = child.get("block_type")
+            cid = child.get("id", "")
+            # Referenced children are inlined into the parent (its refs are
+            # resolved below), so emitting them again would duplicate markup.
+            if inlined and cid and (f"src='{cid}'" in html or f'src="{cid}"' in html):
+                continue
+            if ctype in _NESTED_STRUCTURAL_CHILD_TYPES:
+                continue
+            if ctype == "Page":
+                parts = cid.split("/")
+                if len(parts) > 2 and parts[2].isdigit():
+                    page_info[int(parts[2])] = {
+                        "bbox": child.get("bbox", []),
+                        "polygon": child.get("polygon", []),
+                    }
+                walk(child)          # physical container, not content
+                continue
+            child_html = _resolve_content_refs(child.get("html") or "", by_id, child)
+            # Nested Picture blocks have empty html — the image is implicit
+            # in "images". The flat format expects an <img> tag whose src
+            # matches the images key, so synthesise one for each merged
+            # image not already referenced by the resolved markup.
+            for img_id in child.get("images") or {}:
+                if f"src='{img_id}'" not in child_html and f'src="{img_id}"' not in child_html:
+                    child_html += f"<img src='{img_id}'></img>"
+            out = dict(child, html=child_html)
+            blocks.append(out)
+            walk(out, inlined=True)  # keep any unreferenced grandchildren
+
+    if root.get("block_type") == "Page":
+        cid = root.get("id", "")
+        parts = cid.split("/")
+        if len(parts) > 2 and parts[2].isdigit():
+            page_info[int(parts[2])] = {"bbox": root.get("bbox", []),
+                                        "polygon": root.get("polygon", [])}
+        walk(root)
+    else:
+        walk(root)
+    return blocks, page_info
+
+
 @dataclass
 class Block:
     """One merged content block, normalised onto its true page."""
@@ -272,8 +398,16 @@ class Book:
         with open(content_path, encoding="utf-8") as f:
             raw = json.load(f)
 
+        # Nested "document format" (tree of children with content-ref
+        # pointers) is auto-flattened into the flat blocks + page_info form.
+        pages_from_tree: dict[int, dict] = {}
+        if "blocks" not in raw and (raw.get("children") or raw.get("block_type")):
+            raw_blocks, pages_from_tree = _flatten_marker_nested(raw)
+        else:
+            raw_blocks = raw.get("blocks", [])
+
         blocks: list[Block] = []
-        for rb in raw.get("blocks", []):
+        for rb in raw_blocks:
             # Canonical page: the /page/N/ prefix of the id.
             page = int(rb["id"].split("/")[2])
             btype = BlockType(rb["block_type"])
@@ -287,15 +421,15 @@ class Book:
                 html=rb.get("html", ""),
                 page=page,
                 bbox=tuple(rb.get("bbox", (0, 0, 0, 0))),
-                polygon=rb.get("polygon", []),
-                section_hierarchy=rb.get("section_hierarchy", {}),
-                images=rb.get("images", {}),
+                polygon=rb.get("polygon") or [],
+                section_hierarchy=rb.get("section_hierarchy") or {},
+                images=rb.get("images") or {},
                 heading_level=heading,
             ))
 
         pages: dict[int, PageInfo] = {}
-        for key, info in raw.get("page_info", {}).items():
-            bbox = info.get("bbox", [0, 0, 0, 0])
+        for key, info in {**pages_from_tree, **(raw.get("page_info") or {})}.items():
+            bbox = info.get("bbox") or [0, 0, 0, 0]
             pages[int(key)] = PageInfo(
                 index=int(key),
                 width=bbox[2] - bbox[0],
@@ -321,7 +455,7 @@ class Book:
                     title=e["title"],
                     page=e["page_id"],
                     polygon=e.get("polygon", []),
-                    level=block.heading_level if block else None,
+                    level=block.heading_level if block else (e.get("heading_level") or None),
                 ))
             for s in meta.get("page_stats", []):
                 stats.append(PageStat(

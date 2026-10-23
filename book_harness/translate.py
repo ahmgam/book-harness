@@ -102,12 +102,17 @@ class OllamaClient:
     ) -> str:
         if not self.model:
             raise RuntimeError("pick_model() must be called before generate()")
+        opts = {**GENERATE_OPTIONS, **(options or {})}
         payload: dict[str, Any] = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "options": {**GENERATE_OPTIONS, **(options or {})},
+            "options": opts,
         }
+        # ``think`` is a top-level request field for reasoning models
+        # (qwen3.x & co.), NOT an option: hoist it if a caller set it.
+        if "think" in opts:
+            payload["think"] = bool(opts.pop("think"))
         if system:
             payload["system"] = system
         out = self._post("/api/generate", payload)

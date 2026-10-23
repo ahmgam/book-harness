@@ -6,6 +6,11 @@ priority, and only consults the LLM when two sources tie — recording the
 reason either way. Every entry is a citation: source dictionary, Wikidata ID,
 printed page, archive.org scan URL, plus ``status`` and ``decided_by``.
 
+Dictionary rows frequently hold several synonym renderings in one
+``arabic`` field (joined by ``؛`` / ``،``); ``split_renderings`` atomizes them
+so each option the consistency stage (`consistency.py`) chooses from is a
+single clean rendering.
+
 Output: ``glossary.yaml`` with a ``version`` that feeds the chunk cache keys.
 Uncertified fallback (PLAN.md catch #5): uncovered terms are written with
 ``status: uncertified`` and no fabrication — the suggested rendering is to
@@ -24,7 +29,6 @@ from typing import Any, Iterable
 import yaml
 
 from book_harness import config
-from book_harness.terms import GlinerExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +60,89 @@ def dictionary_allowed(dictionary: str, domains: Iterable[str]) -> bool:
     return any(pat.lower() in hay for pat in allowed)
 
 
+# ---------------------------------------------------------------------------
+# Compound renderings -> atomic options
+# ---------------------------------------------------------------------------
+
+#: Arabic comma (U+060C), Arabic semicolon (U+061B) — the separators the
+#: dictionaries use to stack synonyms inside one ``arabic`` field.
+_CLAUSE_RE = re.compile(r"\s*؛\s*")
+_PART_RE = re.compile(r"\s*،\s*")
+#: The dictionary's perfective verb glosses («سَمَّرَ», «دَسَرَ») end in a
+#: fatha-marked letter; declined nouns end in ة/دamma/other marks instead.
+_VERB_TOKEN_RE = re.compile(r"[\u0621-\u064A]\u064E$")
+
+_GLOSS_LIMIT_FALLBACK = 60
+
+
+def _gloss_limit() -> int:
+    return max(1, getattr(config, "GLOSSARY_MAX_TERM_CHARS", None)
+               or _GLOSS_LIMIT_FALLBACK)
+
+
+def _arabic_tokens(part: str) -> list[str]:
+    """Letter-plus-diacritic runs; the tokens verb detection looks at."""
+    return [
+        t for t in re.findall(r"[\u0621-\u06FF][\u0621-\u06FF\u064B-\u0652]*", part)
+        if t.strip()
+    ]
+
+
+def _is_verb_gloss(part: str) -> bool:
+    """True when a rendering part is a verb paraphrase (usage note, not a
+    translation): some word-token ends in the perfective fatha form the
+    dictionaries append as "also said" glosses (``قَشَرَ، كَشَطَ``).
+    Verb glosses are dropped, per the confirmed single-nominal policy.
+    """
+    return any(_VERB_TOKEN_RE.search(t) for t in _arabic_tokens(part))
+
+
+def split_renderings(ar: str) -> list[str]:
+    """Atomize one dictionary ``arabic`` string into single renderings.
+
+    Splits on the Arabic semicolon (clause boundary) then the Arabic comma
+    (synonym boundary). Guards:
+
+    * a parenthetical qualifier (``(كِيماويَّة)``) stays attached to the
+      preceding part — it is a domain note, not an independent rendering;
+    * verb-gloss parts are dropped entirely (may empty the row — the caller
+      treats an empty result as "row is a usage note, no rendering");
+    * parts longer than ``GLOSSARY_MAX_TERM_CHARS`` are dropped;
+    * duplicate parts collapse (first occurrence wins, priority order).
+    """
+    text = (ar or "").strip()
+    if not text:
+        return []
+    parts: list[str] = []
+    for clause in _CLAUSE_RE.split(text):
+        for piece in _PART_RE.split(clause.strip()):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if piece.startswith("(") and piece.endswith(")"):
+                if parts:                       # domain note on the previous
+                    parts[-1] = f"{parts[-1]} {piece}".strip()
+                continue
+            if _is_verb_gloss(piece) or len(piece) > _gloss_limit():
+                continue
+            if piece not in parts:
+                parts.append(piece)
+    return parts
+
+
+def _expand_hit(h: dict) -> list[str]:
+    """Atomic renderings of one dictionary hit (may be empty — verb row)."""
+    return split_renderings(h.get("ar") or "")
+
+
 class GlossaryEntry(dict):
-    """Dict-style entry; keys follow the cited-artifact contract."""
+    """Dict-style entry; keys follow the cited-artifact contract.
+
+    ``alternatives`` holds the non-selected Arabic renderings,
+    ``alternative_sources`` the parallel dictionary names (kept for the
+    translation-selection prompt; same length, unknown when merged from
+    older runs).
+    """
 
     @classmethod
     def from_hits(
@@ -67,6 +152,7 @@ class GlossaryEntry(dict):
         chosen: dict | None,
         *,
         alternatives: list[str],
+        alternative_sources: list[str] | None = None,
         status: str,
         decided_by: str,
         reason: str = "",
@@ -82,6 +168,7 @@ class GlossaryEntry(dict):
             status=status,
             decided_by=decided_by,
             alternatives=alternatives,
+            alternative_sources=alternative_sources or [],
             reason=reason,
         )
 
@@ -97,6 +184,7 @@ class GlossaryEntry(dict):
             status=STATUS_UNCERTIFIED,
             decided_by="auto",
             alternatives=[],
+            alternative_sources=[],
             reason=reason,
         )
 
@@ -148,24 +236,69 @@ class GlossaryBuilder:
                 "no dictionary hit" if not hits
                 else "all hits excluded by domain whitelist",
             )
-        best = unique[0]
-        best_key = dictionary_sort_key(best.get("source_tech") or best.get("source") or "")
+        # Atomize: every dictionary row contributes its atomic renderings
+        # (compound rows split, verb-gloss parts dropped), in dictionary
+        # priority order — the options the consistency stage chooses from.
+        options: list[tuple[str, str, dict]] = []
+        seen_parts: set[str] = set()
+        split_notes = 0
+        for h in unique:
+            parts = _expand_hit(h)
+            if len(parts) > 1:
+                split_notes += 1
+            for part in parts:
+                if part in seen_parts:
+                    continue
+                seen_parts.add(part)
+                options.append(
+                    (part, h.get("source") or h.get("source_tech") or "", h)
+                )
+        if not options:
+            return GlossaryEntry.uncertified(
+                term,
+                "all dictionary renderings are verb glosses "
+                "(usage notes, not terms)",
+            )
+        best_part, best_source, best_hit = options[0]
+        best_key = dictionary_sort_key(
+            best_hit.get("source_tech") or best_hit.get("source") or ""
+        )
         tied = [h for h in unique
                 if dictionary_sort_key(h.get("source_tech") or h.get("source") or "") == best_key]
-        alternatives = [h["ar"] for h in unique[1:]]
+        alternatives = [part for part, _, _ in options[1:]]
+        alternative_sources = [source for _, source, _ in options[1:]]
+        chosen = dict(best_hit)
+        chosen["ar"] = best_part
+        chosen["source"] = best_source
+        reason = (
+            ("highest dictionary priority; tied candidates exist but "
+             "LLM adjudication unavailable" if len(tied) > 1
+             else "highest dictionary priority")
+        )
+        if split_notes:
+            reason += (f"; {split_notes} compound dictionary "
+                       f"entr{'y' if split_notes == 1 else 'ies'} atomized")
         if len(tied) > 1 and self.assist_model is not None:
-            chosen, reason, via_llm = self._llm_adjudicate(term, best, tied)
+            hit, tie_reason, via_llm = self._llm_adjudicate(
+                term, best_hit, tied
+            )
+            pick = _expand_hit(hit)
+            chosen = dict(hit)
+            chosen["ar"] = pick[0] if pick else hit.get("ar")
+            chosen["source"] = hit.get("source") or hit.get("source_tech") or ""
+            extra = "; compound dictionary entries atomized" if len(pick) > 1 else ""
             return GlossaryEntry.from_hits(
                 term, unique, chosen, alternatives=alternatives,
+                alternative_sources=alternative_sources,
                 status=STATUS_LLM_CHOSEN if via_llm else STATUS_CERTIFIED,
-                decided_by="llm" if via_llm else "auto", reason=reason,
+                decided_by="llm" if via_llm else "auto",
+                reason=tie_reason + extra,
             )
         return GlossaryEntry.from_hits(
-            term, unique, best, alternatives=alternatives,
+            term, unique, chosen, alternatives=alternatives,
+            alternative_sources=alternative_sources,
             status=STATUS_CERTIFIED, decided_by="auto",
-            reason=("highest dictionary priority; tied candidates exist but "
-                    "LLM adjudication unavailable" if len(tied) > 1
-                    else "highest dictionary priority"),
+            reason=reason,
         )
 
     # -- internals ---------------------------------------------------------

@@ -115,6 +115,114 @@ class TestBook:
         assert "$" in md
 
 
+class TestNestedDocumentFormat:
+    """marker's nested "document format" (children tree + content-ref
+    pointers) is auto-flattened into the flat blocks + page_info form."""
+
+    @pytest.fixture
+    def nested_book(self, tmp_path: Path) -> Book:
+        # Two pages: page 0 = header + text; page 1 = header + a PictureGroup
+        # (with a Caption and a Picture child we inlined), a ListGroup with
+        # ListItem children, a Table with unreferenced TableCells, chrome.
+        pic = {
+            "id": "/page/1/Picture/1", "block_type": "Picture", "html": "",
+            "polygon": [], "bbox": [0, 0, 10, 10], "children": None,
+            "images": {"/page/1/Picture/1": "/9j/4AAQSkZJRgABAQ=="},
+        }
+        cap = {
+            "id": "/page/1/Caption/0", "block_type": "Caption",
+            "html": "<p>Figure 1: overview</p>", "polygon": [], "bbox": [0, 0, 10, 10],
+            "children": None, "images": None,
+        }
+        group = {
+            "id": "/page/1/PictureGroup/2", "block_type": "PictureGroup",
+            "html": ("<content-ref src='/page/1/Caption/0'></content-ref>"
+                     "<content-ref src='/page/1/Picture/1'></content-ref>"),
+            "polygon": [], "bbox": [0, 0, 10, 10],
+            "children": [cap, pic], "images": None,
+        }
+        li1 = {"id": "/page/1/ListItem/0", "block_type": "ListItem",
+               "html": "<li>Set the altitude</li>", "polygon": [], "bbox": [0, 0, 10, 10],
+               "children": None, "images": None}
+        lst = {"id": "/page/1/ListGroup/1", "block_type": "ListGroup",
+               "html": ("<p><ul><content-ref src='/page/1/ListItem/0'></content-ref>"
+                        "</ul></p>"),
+               "polygon": [], "bbox": [0, 0, 10, 10],
+               "children": [li1], "images": None}
+        standalone = {
+            "id": "/page/1/Picture/3", "block_type": "Picture", "html": "",
+            "polygon": [], "bbox": [0, 0, 10, 10], "children": None,
+            "images": {"/page/1/Picture/3": "/9j/4AAQSkZJRgABAQ=="},
+        }
+        cell = {"id": "/page/1/TableCell/0", "block_type": "TableCell",
+                "html": "<th>x</th>", "polygon": [], "bbox": [0, 0, 10, 10],
+                "children": None, "images": None}
+        tbl = {"id": "/page/1/Table/1", "block_type": "Table",
+               "html": "<table><tbody><tr><th>x</th></tr></tbody></table>",
+               "polygon": [], "bbox": [0, 0, 10, 10],
+               "children": [cell], "images": None}
+        pages = []
+        for pg, content in ((0, [
+                {"id": "/page/0/SectionHeader/0", "block_type": "SectionHeader",
+                 "html": "<h1>Lecture Notes</h1>", "polygon": [], "bbox": [0, 0, 10, 10],
+                 "children": None, "images": None, "section_hierarchy": {"1": "/page/0/SectionHeader/0"}},
+                {"id": "/page/0/Text/1", "block_type": "Text",
+                 "html": "<p>The skin is the largest organ.</p>", "polygon": [],
+                 "bbox": [0, 0, 10, 10], "children": None, "images": None},
+                {"id": "/page/0/PageFooter/2", "block_type": "PageFooter",
+                 "html": "<p>footer</p>", "polygon": [], "bbox": [0, 0, 10, 10],
+                 "children": None, "images": None}]),
+            (1, [
+                json.loads(json.dumps(group)),
+                json.loads(json.dumps(lst)),
+                json.loads(json.dumps(standalone)),
+                json.loads(json.dumps(tbl))])):
+            # Page html references all of its children (pure structure).
+            refs = "".join(f"<content-ref src='{c['id']}'></content-ref>" for c in content)
+            pages.append({
+                "id": f"/page/{pg}/Page/0", "block_type": "Page",
+                "html": refs, "polygon": [], "bbox": [0, 0, 200, 300],
+                "children": content, "images": None,
+            })
+        raw = {"block_type": "Document", "children": pages}
+        main = tmp_path / "nested.json"
+        main.write_text(json.dumps(raw), encoding="utf-8")
+        meta = tmp_path / "nested_meta.json"
+        meta.write_text(json.dumps({"table_of_contents": [
+            {"title": "Lecture Notes", "page_id": 0, "heading_level": 1},
+        ]}), encoding="utf-8")
+        return Book.from_marker_json(main)
+
+    def test_pages_and_content_flattened(self, nested_book):
+        assert nested_book.num_pages == 2          # from Page bboxes
+        page0 = nested_book.page(0)
+        assert {b.type for b in page0} == {BlockType.SECTION_HEADER, BlockType.TEXT,
+                                          BlockType.PAGE_FOOTER}
+
+    def test_group_children_inlined_not_emitted(self, nested_book):
+        page1 = nested_book.page(1)
+        by_type = {b.type: b for b in page1}
+        pg = by_type[BlockType.PICTURE_GROUP]
+        # caption markup + img tag synthesised for the implicit picture
+        assert "Figure 1: overview" in pg.html
+        assert "src='/page/1/Picture/1'" in pg.html
+        # image data travelled from the Picture child into the group
+        assert list(pg.images) == ["/page/1/Picture/1"]
+        pic = by_type[BlockType.PICTURE]
+        assert "/page/1/Picture/1" not in [b.id for b in page1]   # inlined only
+        assert "<img src='/page/1/Picture/3'" in pic.html   # standalone picture
+        assert list(pic.images) == ["/page/1/Picture/3"]
+
+    def test_list_items_inlined(self, nested_book):
+        lst = next(b for b in nested_book.page(1) if b.type is BlockType.LIST_GROUP)
+        assert "<li>" in lst.html and "Set the altitude" in lst.html
+        assert not any(b.type.value in ("ListItem", "TableCell") for b in nested_book.blocks)
+
+    def test_table_children_dropped(self, nested_book):
+        tbl = next(b for b in nested_book.page(1) if b.type is BlockType.TABLE)
+        assert "<tr><th>x</th></tr>" in tbl.html
+
+
 # ---------------------------------------------------------------------------
 # Chunker (1.7)
 # ---------------------------------------------------------------------------

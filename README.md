@@ -10,7 +10,7 @@ Translating a scientific book with an LLM naively produces: inconsistent termino
 
 Two phases, both file-backed and resumable:
 
-**Phase 1 — Glossary generation.** Extract terms from the book (GLiNER zero-shot NER + noun-phrase/n-gram mining + LLM adjudication), then look them up in [arabterm](https://github.com/forzagreen/arabterm) — a collection of certified Arabic/English/French dictionaries (KSAA unified glossaries, Librairie du Liban, etc.) shipped as SQLite with full provenance: source dictionary, Wikidata ID, archive.org scan URL, printed page number. Every glossary entry is a **citation**, not a pair. Conflicts are resolved by a deterministic dictionary priority; uncovered terms get an explicit `uncertified` status for human review.
+**Phase 1 — Glossary generation.** Extract terms from the book with a small LLM (one call per chunk, PLAN §8), then look them up in [arabterm](https://github.com/forzagreen/arabterm) — a collection of certified Arabic/English/French dictionaries (KSAA unified glossaries, Librairie du Liban, etc.) shipped as SQLite with full provenance: source dictionary, Wikidata ID, archive.org scan URL, printed page number. Every glossary entry is a **citation**, not a pair. Conflicts are resolved by a deterministic dictionary priority; uncovered terms get an explicit `uncertified` status for human review.
 
 **Phase 2 — Translation.** The book is chunked section-by-section from the OCR structure; each chunk is translated by a dedicated local MT model (Tencent **Hy-MT2-30B-A3B**, or TranslateGemma) with the glossary injected using the model's official terminology template, plus prior-paragraph and rolling-chapter context. Results are cached and resumable. Then a **3-phase guarded refinement** per chunk:
 
@@ -29,7 +29,7 @@ flowchart TD
     A[PDF] --> O[OCR: marker/datalab<br/>main JSON + _meta.json]
     O --> B[Consolidate: book.py Book model<br/>typed blocks + outline + images]
     B --> P[Phase 0: profile - domain, style, entities]
-    P --> C[Term extraction: GLiNER + n-gram mining]
+    P --> C[Term extraction: LLM per chunk + book-glossary harvest]
     C --> D[arabterm lookup: SQLite, domain-filtered]
     D --> E{certified hit?}
     E -- yes --> F[glossary.yaml + citations]
@@ -67,10 +67,10 @@ Chunks are **section-aligned** (consecutive content blocks within one outline se
 | Translation | `tencent/Hy-MT2-30B-A3B` | MoE (~3B active), 33 languages incl. Arabic, Apache-2.0, official terminology prompt template |
 | Translation (light) | `google/translategemma-4b/12b/27b-it` | Gemma3-based, 55 languages |
 | Refine / verify | `Qwen/Qwen3.5-27B` or `google/gemma-4-26B-A4B-it` | General instruct model for MQM spans + A/B judging |
-| Term extraction | `urchade/gliner_multi-v2.1` | Zero-shot NER, CPU-friendly, custom labels |
+| Term extraction | small instruct via Ollama (e.g. `qwen3.5:4b`) | Fully LLM-based (PLAN §8): one call per chunk, `BOOK_HARNESS_EXTRACT_MODELS` role; replies cached in `02_glossary/extract-cache.jsonl` |
 | Quality estimation | `Unbabel/wmt22-cometkiwi-da` | Reference-free QE (CC-BY-NC) |
 | Terminology DB | `arabterm.db` (SQLite) | AR/EN/FR, Wikidata + archive.org provenance built in |
-| OCR / ingest | marker (datalab) + `book.py` | Main JSON + `_meta.json` → `Book` model |
+| OCR / ingest | marker (datalab) + `book.py` | Main JSON + `_meta.json` → `Book` model (flat and nested "document" OCR layouts) |
 
 ## Design principles
 
@@ -117,7 +117,7 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 
 | # | Catch | Proposed solution |
 |---|---|---|
-| 1 | **GLiNER finds entities, not terms.** Zero-shot NER catches people/orgs/places, but book terminology is mostly multiword technical noun phrases ("reinforcement learning", "supply chain") that NER misses. | 3-signal extraction pipeline: GLiNER (with custom labels like `technical_term`) + noun-phrase/n-gram mining with TF-IDF rarity scoring + an LLM adjudication pass that merges, dedupes, and classifies candidates (term vs. name vs. noise). |
+| 1 | **GLiNER finds entities, not terms.** Zero-shot NER catches people/orgs/places, but book terminology is mostly multiword technical noun phrases ("reinforcement learning", "supply chain") that NER misses. | Extraction pipeline evolved: GLiNER + n-gram mining (M1) was superseded by fully LLM-based extraction (PLAN §8) — a small instruct model reads the book chunk by chunk and lists the terms itself (`llm_terms.py`), with the book's own glossary pages harvested as an extra signal. |
 | 2 | **Same word, different domains, different translations.** "Cell", "field", "interest" translate differently by domain; a flat lookup produces wrong terms. | **Phase 0 book profiling**: classify book/chapters into domains, then filter the arabterm lookup by a domain → dictionary whitelist (arabterm is already organized as separate dictionaries — military, finance, linguistics, legal, aerospace…). |
 | 3 | **A glossary pair is not a citation.** Without provenance, "certified" is unverifiable. | Every glossary entry is a cited artifact: source dictionary name, Wikidata ID, printed page, archive.org scan URL, plus `status` (`certified | llm_chosen | uncertified`) and `decided_by` (`auto | llm | human`). |
 | 4 | **LLM conflict resolution is nondeterministic.** When dictionaries disagree, letting the model "choose" each time yields inconsistent priorities. | Deterministic conflict policy encoded up front (e.g., KSAA unified glossaries > Librairie du Liban > others); LLM choice only on ties, with the reason recorded. |
@@ -156,7 +156,7 @@ The analysis in [brainstorming.md](./brainstorming.md) surfaced several catches 
 
 ## Roadmap
 
-- **M1 — MVP (done):** OCR JSON in (via `book.py`) → GLiNER + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
+- **M1 — MVP (done):** OCR JSON in (via `book.py`) → LLM-extracted + arabterm glossary with citations → Ollama translation of typed content blocks → markdown out.
 - **M2 — Accuracy (implemented):** refinement loop (estimate/patch/verify) + QE-budgeted scheduling + compliance/consistency audits + OCR gate + model bake-off. Task 2.7 exit criteria (bake-off report + held-out QE improvement) need a real local model run.
 - **M3 — Artifacts (implemented):** glossary appendix, bilingual HTML, QA report, provenance manifest, TMX export, glossary drift loop (`drift` command + drift stage), outline repair. Artifact exit criteria (3.1–3.5) run on real data; 3.6 human confirmation is CLI-driven.
 - **M3.5 — MCP server (implemented):** `book-harness-mcp` — a dependency-free MCP stdio server (`book_harness/mcp_server.py`) exposing `lookup_term`, `get_glossary`, `translate_chunk`, `list_runs` for agent-driven workflows, with the agent workflow guide in [`mcp/AGENT.md`](./mcp/AGENT.md).
@@ -173,7 +173,7 @@ See [PLAN.md](./PLAN.md) for the full task-by-task implementation plan.
 
 ## Status
 
-**M1 (MVP) + M2 (accuracy) + M3 (artifacts) + M3.5 (MCP server) + M4 (web UI) implemented** — OCR JSON in → n-gram/GLiNER term extraction → arabterm citations glossary → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + consistency audits → outline repair → glossary drift loop → appendix/bilingual/TMX/QA-report/manifest assembly → MCP tools for agent-driven runs → serve with live SSE progress + human review (uncertified terms, low-QE chunks) writing back to the artifacts. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6, M3 tasks 3.1–3.7, M3.5 tasks 3.5.1–3.5.2, M4 tasks 4.1–4.2); the validation runs (1.12, M2 exit criteria) require a real local model:
+**M1 (MVP) + M2 (accuracy) + M3 (artifacts) + M3.5 (MCP server) + M4 (web UI) implemented** — OCR JSON in → LLM-based term extraction (small model, chunk by chunk, chunk-tracked occurrences) → arabterm citations glossary (compound rows atomized, verb glosses dropped) → **consistency stage: one rendering per term issued as a new glossary version** → section-aligned chunking with placeholder protection → Ollama translation with rolling chapter context → QE-scored, guarded refinement → compliance + drift-audit → outline repair → glossary drift loop → appendix/bilingual/TMX/QA-report/manifest assembly → MCP tools for agent-driven runs → serve with live SSE progress + human review (uncertified terms, low-QE chunks) writing back to the artifacts. See [PLAN.md](./PLAN.md) (M1 tasks 1.1–1.11, M2 tasks 2.1–2.6, M3 tasks 3.1–3.7, M3.5 tasks 3.5.1–3.5.2, M4 tasks 4.1–4.2); the validation runs (1.12, M2 exit criteria) require a real local model:
 
 ```bash
 book-harness run <main-ocr-json>            # full book (local model required)
@@ -184,12 +184,12 @@ book-harness-mcp                            # M3.5 MCP stdio server (agents)
 
 Run artifacts land in `runs/<book-id>/` (see below). Every stage is resumable; drafts are keyed by `hash(source_chunk + glossary_version + model + prompt_version)`.
 
-> Verified checklist (PLAN §3): arabterm db loads with domain → dictionary whitelists (aerospace-engineering, information-tech, …); Hy-MT2-30B-A3B GGUF is available for Ollama (`ollama pull melashri/hy-mt2-30b-a3b`); GLiNER works when the `gliner` extra + HF access are available and the pipeline falls back to n-gram mining otherwise.
+> Verified checklist (PLAN §3): arabterm db loads with domain → dictionary whitelists (aerospace-engineering, information-tech, …); Hy-MT2-30B-A3B GGUF is available for Ollama (`ollama pull melashri/hy-mt2-30b-a3b`); term extraction is fully LLM-based (PLAN §8) — a small instruct model (e.g. `qwen3.5:4b`) reads the book chunk by chunk and lists the terms.
 
 ## Refinement & QA (M2)
 
 Implemented on top of the M1 pipeline; the full `run` now goes
-**source → terms → glossary → chunk → gate → translate → qe → refine → compliance → consistency → assemble**.
+**source → terms → glossary → consistency → chunk → gate → translate → qe → refine → compliance → drift-audit → assemble**.
 
 | Stage | What it does | Artifacts (`06_qa/`, `05_refine/`) |
 |---|---|---|
@@ -197,7 +197,7 @@ Implemented on top of the M1 pipeline; the full `run` now goes
 | `qe` (2.1) | Reference-free quality estimation per chunk. cometkiwi when the optional `unbabel-comet` stack is installed; otherwise an LLM judge scoring every unit 0–100 (average → chunk score) | `qe-scores.jsonl` |
 | `refine` (2.2 + 2.3) | Guarded loop on the worst-scoring chunks first: ① a general-instruct model locates ≤12 MQM error spans per unit; ② pure-Python literal substring patches (spans must match exactly once); ③ A/B verify run twice with swapped positions — a patch is applied only on a 2/2 vote, otherwise the draft text stays | `chunk-NNNN.spans.json`, `chunk-NNNN.patches.jsonl`, `chunk-NNNN.verdicts.jsonl`, `chunk-NNNN.refined.json` |
 | `compliance` (2.4) | Certified-glossary enforcement per chunk through the shared Arabic normalizer with clitic tolerance (ال، وال، بال، لل…). Chunks below the floor are **re-queued for targeted re-translation**: the violated term pairs are injected as a MANDATORY glossary block and folded into the chunk's cache key, so only offending chunks regenerate | `compliance.jsonl` |
-| `consistency` (2.5) | Book-wide drift audit: the certified rendering of each term vs. its dictionary alternatives — a chunk using an alternative form where the certified form is expected is reported | `consistency.jsonl` |
+| `drift-audit` (2.5) | Book-wide drift audit: the certified rendering of each term vs. its dictionary alternatives — a chunk using an alternative form where the certified form is expected is reported | `consistency.jsonl` |
 
 Assembly prefers verified refined unit texts (`refined.json`, only when its recorded draft cache key still matches — a re-translated chunk automatically expires its refinement).
 
@@ -228,11 +228,12 @@ Translates an even sample of chunks through every installed candidate in an isol
 ## Artifacts & robustness (M3)
 
 The full `run` pipeline is now
-**source → outline-repair → terms → glossary → chunk → gate → translate → qe → refine → compliance → consistency → drift → artifacts → assemble**.
+**source → outline-repair → terms → glossary → consistency → chunk → gate → translate → qe → refine → compliance → drift-audit → drift → artifacts → assemble**.
 
 | Stage | Task | What it does | Artifacts |
 |---|---|---|---|
 | `outline-repair` (3.7) | Re-derives heading depth from section-numbering patterns (`1` → h1, `1.2` → h2, `1.2.1` → h3) when the OCR `h`-tags mis-nest; a continuity guard leaves stray numerals and unnumbered titles untouched; the outline tree is rebuilt | `00_source/outline-repair.json` |
+| `consistency` (3.0) | Post-glossary adjudication: for every certified term with several *atomic* renderings (compound rows like `مُعامَلَة، مُعالَجَة (كِيماويَّة)؛ …` are split, verb glosses dropped), the assist model picks one using the chunks the term occurs in; `glossary.yaml` is re-issued as a **new version** with exactly one `term_ar` per entry | `02_glossary/consistency-decisions.jsonl`, `consistency-cache.jsonl`, new `glossary.yaml` version |
 | `drift` (3.6) | Mines recurring English n-grams across the *source* chunks that the glossary does not cover → proposed `uncertified` candidates for human review | `02_glossary/drift-candidates.jsonl` |
 | `artifacts` (3.1–3.5) | Writes the glossary appendix, bilingual HTML, QA report and TMX from the stage files — pure file I/O, no model | `07_output/glossary-appendix.md`, `bilingual.html`, `qa-report.md`, `book.tmx` |
 
@@ -319,11 +320,12 @@ python -m venv .venv && .venv/bin/pip install -e ".[tests]"
 ```
 
 For serving/role configuration, copy [`.env.example`](./.env.example) to
-`.env`, edit, and export it before running (the project doesn't auto-load
-`.env` files):
+`.env` and edit it — the CLI, MCP server and library imports auto-load it
+at startup (working directory first, then the project root; an explicitly
+exported variable always wins over the file):
 
 ```bash
-set -a; source .env; set +a      # bash/zsh
+cp .env.example .env && $EDITOR .env    # no export needed
 ```
 
 Key options: `--model` (force an installed model), `--domains aerospace`,

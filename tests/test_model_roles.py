@@ -9,14 +9,32 @@ import book_harness.config as config
 from book_harness import cli
 
 
-def test_defaults_unchanged_when_env_unset(monkeypatch):
+def test_defaults_when_env_unset(monkeypatch):
+    """Clean env → built-in defaults via ``_env_models`` resolution.
+
+    Module-level constants are resolved at import and may legitimately come
+    from an auto-loaded ``.env`` (they are asserted separately); the env
+    parsing and the role inheritance cascade are asserted here live.
+    """
     monkeypatch.delenv("BOOK_HARNESS_TRANSLATION_MODELS", raising=False)
     monkeypatch.delenv("BOOK_HARNESS_TRANSLATION_MODEL", raising=False)
     monkeypatch.delenv("BOOK_HARNESS_ASSIST_MODELS", raising=False)
+    monkeypatch.delenv("BOOK_HARNESS_ASSIST_MODEL", raising=False)
+    monkeypatch.delenv("BOOK_HARNESS_QE_MODELS", raising=False)
     monkeypatch.delenv("BOOK_HARNESS_QE_MODEL", raising=False)
-    assert config.TRANSLATION_MODELS == config._MODEL_DEFAULTS
-    assert config.ASSIST_MODELS == config.TRANSLATION_MODELS     # inherited
-    assert config.QE_MODELS == config.ASSIST_MODELS              # inherited
+    resolve = config._env_models
+    translation = resolve(
+        "BOOK_HARNESS_TRANSLATION_MODELS", "BOOK_HARNESS_TRANSLATION_MODEL",
+        config._MODEL_DEFAULTS,
+    )
+    assert translation == config._MODEL_DEFAULTS
+    # cascade: unset roles inherit the previous level's list
+    assert resolve(
+        "BOOK_HARNESS_ASSIST_MODELS", "BOOK_HARNESS_ASSIST_MODEL", translation
+    ) == translation
+    assert resolve(
+        "BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", translation
+    ) == translation
 
 
 def test_env_models_parse_lists_commas_and_singular(monkeypatch):

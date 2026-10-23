@@ -14,8 +14,13 @@ import sys
 from pathlib import Path
 
 from book_harness import config
+from book_harness import consistency as consistency_mod
 from book_harness import glossary as glossary_mod
+from book_harness import glossary_pages as glossary_pages_mod
+from book_harness import occurrences as occurrences_mod
+from book_harness import pages as pages_mod
 from book_harness import terms as terms_mod
+from book_harness import llm_terms as llm_terms_mod
 from book_harness.arabterm import Arabterm, ensure_db
 from book_harness.book import Book
 from book_harness.chunker import plan_chunks, write_chunks
@@ -25,9 +30,9 @@ from book_harness.state import RunState
 logger = logging.getLogger("book-harness")
 
 STAGES = [
-    "source", "outline-repair", "terms", "glossary", "chunk", "gate",
-    "translate", "qe", "refine", "compliance", "consistency", "drift",
-    "artifacts", "assemble", "format",
+    "source", "outline-repair", "terms", "glossary", "consistency", "chunk",
+    "gate", "translate", "qe", "refine", "compliance", "drift-audit",
+    "drift", "artifacts", "assemble", "format",
 ]
 
 
@@ -53,10 +58,62 @@ def stage_source(settings: Settings, book: Book) -> Path:
 
 def stage_terms(settings: Settings, book: Book) -> list[dict]:
     out = settings.stage_dir(stage="glossary")
-    candidates, gliner_used = terms_mod.extract_candidates(book, logger=logger)
+    extract = _extract_client(settings)
+    candidates = llm_terms_mod.extract_candidates(
+        book,
+        extract,
+        char_ceiling=settings.char_ceiling,
+        char_floor=settings.char_floor,
+        cache_path=out / config.EXTRACT_CACHE_FILE,
+        logger=logger,
+    )
+    page_terms = harvest_book_glossary(settings, book, out)
+    if page_terms:
+        candidates = glossary_pages_mod.merge_candidates(candidates, page_terms)
+    # Document every candidate's occurrences (deterministic book scan) so the
+    # glossary stage can ground translation selection in real usage.
+    chunks = llm_terms_mod.chunk_texts(
+        book, char_ceiling=settings.char_ceiling, char_floor=settings.char_floor
+    )
+    candidates = occurrences_mod.attach_occurrences(candidates, chunks)
     n = terms_mod.write_candidates(candidates, out / config.CANDIDATES_FILE)
-    logger.info("extracted %d term candidates (GLiNER: %s)", n, gliner_used)
+    logger.info(
+        "extracted %d term candidates (extract model: %s, book-glossary: %d, "
+        "with occurrences: %d)",
+        n, getattr(extract, "model", "?"), len(page_terms),
+        sum(1 for c in candidates if c.get("occurrences")),
+    )
     return candidates
+
+
+def harvest_book_glossary(
+    settings: Settings, book: Book, out_dir: Path
+) -> list[dict]:
+    """Detect the book's own glossary pages and harvest their terms.
+
+    Detection is metadata-only (glossary section headers). No glossary →
+    nothing to do, no model needed. Glossary detected → the assist model is
+    mandatory for the harvest: any failure raises and stops the stage.
+    """
+    page_ranges = pages_mod.find_glossary_pages(book)
+    if not page_ranges:
+        return []
+    counts = ", ".join(
+        f"{r.start}–{r.stop - 1}" for r in page_ranges
+    )
+    logger.info("book glossary pages detected: %s", counts)
+    assist = _assist_client(settings)
+    page_terms = glossary_pages_mod.extract_page_terms(
+        book, page_ranges, assist, logger=logger
+    )
+    written = glossary_pages_mod.write_page_terms(
+        page_terms, out_dir / config.GLOSSARY_PAGE_TERMS_FILE
+    )
+    logger.info(
+        "book-glossary harvest: %d terms -> %s",
+        written, out_dir / config.GLOSSARY_PAGE_TERMS_FILE,
+    )
+    return page_terms
 
 
 def stage_glossary(
@@ -67,8 +124,42 @@ def stage_glossary(
     with Arabterm.from_db(db_path) as at:
         builder = glossary_mod.GlossaryBuilder(at, domains=settings.domains)
         entries = builder.build(candidates)
+        # Atomized per the one-rendering-per-term policy: compound dictionary
+        # rows were split, verb glosses dropped; the consistency stage now
+        # picks one rendering per term against the book's occurrences.
     path, version = glossary_mod.write_glossary(entries, out / config.GLOSSARY_FILE)
-    logger.info("glossary: %d entries, version %s -> %s", len(entries), version, path)
+    logger.info(
+        "glossary: %d entries, version %s -> %s",
+        len(entries), version, path,
+    )
+    version, entries = glossary_mod.load_glossary(path)
+    return entries, version, path
+
+
+def stage_consistency(
+    settings: Settings, candidates: list[dict], entries: list[dict]
+) -> tuple[list[dict], str, Path]:
+    """One rendering per term (consistency stage, post-glossary).
+
+    For every certified entry with several available renderings the assist
+    model picks using the chunks the term occurs in (documented during the
+    terms stage). Re-writes ``glossary.yaml`` — a **new glossary version**
+    is issued here, which is what source the translation stage enforces.
+    Fallback: deterministic dictionary priority (best-effort contract).
+    """
+    out = settings.stage_dir(stage="glossary")
+    entries, counts = consistency_mod.choose_translations(
+        entries, candidates,
+        lambda: _assist_client(settings),
+        out,
+        domains=settings.domains, logger=logger,
+    )
+    path, version = glossary_mod.write_glossary(entries, out / config.GLOSSARY_FILE)
+    logger.info(
+        "consistency: %d entries, version %s -> %s "
+        "(chosen: %d, fallback: %d)",
+        len(entries), version, path, counts["chosen"], counts["fallback"],
+    )
     version, entries = glossary_mod.load_glossary(path)
     return entries, version, path
 
@@ -151,6 +242,21 @@ def _translation_client(settings: Settings) -> Any:
         api=settings.api,
         api_key=settings.api_key,
         model=settings.model,
+    )
+
+
+def _extract_client(settings: Settings) -> Any:
+    """Term-extraction role client: the small instruct model (``config.
+    EXTRACT_MODELS``) that lists glossary terms chunk by chunk. Deliberately
+    does not honour the MT ``--model`` override."""
+    from book_harness.translate import build_client
+
+    return build_client(
+        settings.ollama_host,
+        timeout=settings.ollama_timeout,
+        preferred=config.EXTRACT_MODELS,
+        api=settings.api,
+        api_key=settings.api_key,
     )
 
 
@@ -405,7 +511,7 @@ def _log_compliance(records: list[dict]) -> None:
     )
 
 
-def stage_consistency(settings: Settings, chunks: list, entries: list[dict]) -> dict:
+def stage_drift_audit(settings: Settings, chunks: list, entries: list[dict]) -> dict:
     """Book-level terminology drift audit (task 2.5) -> consistency.jsonl."""
     from book_harness.qa import consistency_audit, write_records
 
@@ -687,11 +793,23 @@ def run(settings: Settings) -> int:
 
     state.mark("terms", status="started")
     candidates = stage_terms(settings, book)
-    state.mark("terms", status="done", candidates=len(candidates))
+    book_glossary_pages = pages_mod.find_glossary_pages(book)
+    state.mark(
+        "terms", status="done",
+        candidates=len(candidates),
+        book_glossary_pages=(
+            sum(len(r) for r in book_glossary_pages)
+            if book_glossary_pages else None
+        ),
+    )
 
     state.mark("glossary", status="started")
     entries, version, _path = stage_glossary(settings, candidates)
     state.mark("glossary", status="done", entries=len(entries), version=version)
+
+    state.mark("consistency", status="started")
+    entries, version, _ = stage_consistency(settings, candidates, entries)
+    state.mark("consistency", status="done", version=version)
 
     state.mark("chunk", status="started")
     chunks = stage_chunk(settings, book)
@@ -731,9 +849,9 @@ def run(settings: Settings) -> int:
     stage_compliance(settings, chunks, entries)
     state.mark("compliance", status="done")
 
-    state.mark("consistency", status="started")
-    stage_consistency(settings, chunks, entries)
-    state.mark("consistency", status="done")
+    state.mark("drift-audit", status="started")
+    stage_drift_audit(settings, chunks, entries)
+    state.mark("drift-audit", status="done")
 
     state.mark("drift", status="started")
     if not settings.no_drift:
