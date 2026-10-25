@@ -158,16 +158,19 @@ def stage_consistency(
 ) -> tuple[list[dict], str, Path]:
     """One rendering per term (consistency stage, post-glossary).
 
-    For every certified entry with several available renderings the assist
-    model picks using the chunks the term occurs in (documented during the
-    terms stage). Re-writes ``glossary.yaml`` — a **new glossary version**
-    is issued here, which is what source the translation stage enforces.
-    Fallback: deterministic dictionary priority (best-effort contract).
+    For every certified entry with several available renderings the
+    consistency-role model picks using the chunks the term occurs in
+    (documented during the terms stage). The model preference list is
+    ``config.CONSISTENCY_MODELS`` (the ``BOOK_HARNESS_CONSISTENCY_MODELS``
+    env) and inherits the ASSIST list when unset. Re-writes
+    ``glossary.yaml`` — a **new glossary version** is issued here, which is
+    what source the translation stage enforces. Fallback: deterministic
+    dictionary priority (best-effort contract).
     """
     out = settings.stage_dir(stage="glossary")
     entries, counts = consistency_mod.choose_translations(
         entries, candidates,
-        lambda: _assist_client(settings),
+        lambda: _assist_client(settings, preferred=config.CONSISTENCY_MODELS),
         out,
         domains=settings.domains, logger=logger,
     )

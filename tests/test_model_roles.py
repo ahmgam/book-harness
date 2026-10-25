@@ -1,4 +1,5 @@
-"""Role-based model assignment via env (translation / assist / qe).
+"""Role-based model assignment via env (translation / assist / qe /
+consistency).
 
 Module-level role constants are read at import, so the env parsing itself is
 tested through ``config._env_models`` with monkeypatched env, and the stage
@@ -22,6 +23,8 @@ def test_defaults_when_env_unset(monkeypatch):
     monkeypatch.delenv("BOOK_HARNESS_ASSIST_MODEL", raising=False)
     monkeypatch.delenv("BOOK_HARNESS_QE_MODELS", raising=False)
     monkeypatch.delenv("BOOK_HARNESS_QE_MODEL", raising=False)
+    monkeypatch.delenv("BOOK_HARNESS_CONSISTENCY_MODELS", raising=False)
+    monkeypatch.delenv("BOOK_HARNESS_CONSISTENCY_MODEL", raising=False)
     resolve = config._env_models
     translation = resolve(
         "BOOK_HARNESS_TRANSLATION_MODELS", "BOOK_HARNESS_TRANSLATION_MODEL",
@@ -34,6 +37,14 @@ def test_defaults_when_env_unset(monkeypatch):
     ) == translation
     assert resolve(
         "BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", translation
+    ) == translation
+    # consistency inherits the assist list (which cascades to translation
+    # in a clean env) — unset = the assist model does the stage
+    assert resolve(
+        "BOOK_HARNESS_CONSISTENCY_MODELS",
+        "BOOK_HARNESS_CONSISTENCY_MODEL",
+        resolve("BOOK_HARNESS_ASSIST_MODELS",
+                "BOOK_HARNESS_ASSIST_MODEL", translation),
     ) == translation
 
 
@@ -70,7 +81,7 @@ def test_role_env_overrides_resolve(monkeypatch):
 
 def test_stage_role_wiring(monkeypatch, tmp_path):
     """QE stage uses the QE list; compliance re-queue uses the MT list;
-    refine keeps the assist list."""
+    refine keeps the assist list; consistency uses the CONSISTENCY list."""
     from book_harness.config import Settings
 
     captured: list[list[str]] = []
@@ -88,9 +99,49 @@ def test_stage_role_wiring(monkeypatch, tmp_path):
     cli._assist_client(settings, preferred=config.QE_MODELS)
     cli._assist_client(settings)
     cli._translation_client(settings)
+    cli._assist_client(settings, preferred=config.CONSISTENCY_MODELS)
     assert captured == [list(config.QE_MODELS),
                         list(config.ASSIST_MODELS),
-                        list(config.TRANSLATION_MODELS)]
+                        list(config.TRANSLATION_MODELS),
+                        list(config.CONSISTENCY_MODELS)]
+
+
+def test_stage_consistency_passes_consistency_role(monkeypatch, tmp_path):
+    """``stage_consistency`` builds its client from the CONSISTENCY list
+    (``BOOK_HARNESS_CONSISTENCY_MODELS``), which inherits ASSIST when unset."""
+    import types
+
+    from book_harness.config import Settings
+
+    entries = [{"term_en": "x", "term_ar": "ي"}]
+    captured: list[list[str]] = []
+    factory_holder: dict = {}
+
+    def fake_build_client(host, *, timeout=None, preferred=None,
+                           model=None, api=None, api_key=None):
+        captured.append(preferred or [])
+        return lambda prompt, **kw: ""          # duck-type client
+
+    def fake_choose(entries, candidates, factory, out, **kw):
+        factory_holder["factory"] = factory
+        return entries, {"chosen": 0, "kept": 0, "overridden": 0,
+                         "fallback": 0, "skipped": 0}
+
+    import book_harness.translate as tr
+
+    monkeypatch.setattr(tr, "build_client", fake_build_client)
+    monkeypatch.setattr(
+        cli, "consistency_mod", types.SimpleNamespace(choose_translations=fake_choose))
+    monkeypatch.setattr(
+        cli, "glossary_mod", types.SimpleNamespace(
+            write_glossary=lambda entries, path: (path, "v1"),
+            load_glossary=lambda path: ("v1", entries),
+        ))
+
+    settings = Settings(run_root=tmp_path, ocr_file=tmp_path / "x.json")
+    cli.stage_consistency(settings, [], entries)
+    factory_holder["factory"]()       # lazily build, capture the list
+    assert captured == [list(config.CONSISTENCY_MODELS)]
 
 
 def test_bakeoff_judge_uses_qe_role(monkeypatch, tmp_path):

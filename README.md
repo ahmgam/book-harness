@@ -361,6 +361,7 @@ wins; a set `--model` still overrides everything):
 | translation | chunk MT, drift/compliance re-translation, bake-off candidates, MCP `translate_chunk` | `BOOK_HARNESS_TRANSLATION_MODELS` (`…_MODEL`) | `hy-mt2-30b-a3b, hy-mt2-7b, qwen2.5:14b, llama3.1:8b` |
 | assist | refinement (MQM estimate / A/B verify), rolling chapter summaries | `BOOK_HARNESS_ASSIST_MODELS` (`…_MODEL`) | falls back to the translation list |
 | qe | QE LLM-judge scoring, bake-off judge (`--judge` overrides) | `BOOK_HARNESS_QE_MODELS` (`…_MODEL`) | falls back to the assist list |
+| consistency | post-glossary adjudication (one certified rendering per term; lone-form override checks) | `BOOK_HARNESS_CONSISTENCY_MODELS` (`…_MODEL`) | falls back to the assist list |
 
 ```bash
 export BOOK_HARNESS_TRANSLATION_MODELS="hy-mt2-30b-a3b, qwen2.5:14b"

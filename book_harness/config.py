@@ -141,6 +141,9 @@ TARGET = "ar"
 #:                  chapter summaries
 #: ``qe``           QE LLM-judge scoring + bake-off judge (``--judge``
 #:                  still overrides)
+#: ``consistency``  Post-glossary adjudication: one certified rendering
+#:                  per term picked against the book's occurrences (pick
+#:                  + lone-form override checks)
 #: ``format``       M5 per-page AI formatting (layout-only rewrite);
 #:                  general instruct models, NEVER the MT model
 #: ================ ====================================================
@@ -158,6 +161,7 @@ TARGET = "ar"
 #: * ``BOOK_HARNESS_TRANSLATION_MODELS`` / ``BOOK_HARNESS_TRANSLATION_MODEL``
 #: * ``BOOK_HARNESS_ASSIST_MODELS`` / ``BOOK_HARNESS_ASSIST_MODEL``
 #: * ``BOOK_HARNESS_QE_MODELS`` / ``BOOK_HARNESS_QE_MODEL``
+#: * ``BOOK_HARNESS_CONSISTENCY_MODELS`` / ``BOOK_HARNESS_CONSISTENCY_MODEL``
 #: * ``BOOK_HARNESS_FORMAT_MODELS`` / ``BOOK_HARNESS_FORMAT_MODEL``
 #: * ``BOOK_HARNESS_EXTRACT_MODELS`` / ``BOOK_HARNESS_EXTRACT_MODEL``
 #:
@@ -185,6 +189,17 @@ ASSIST_MODELS = _env_models(
     TRANSLATION_MODELS,
 )
 QE_MODELS = _env_models("BOOK_HARNESS_QE_MODELS", "BOOK_HARNESS_QE_MODEL", ASSIST_MODELS)
+
+#: Post-glossary consistency role: the adjudication stage picks one
+#: certified rendering per term against the book's occurrences (``choose_
+#: translations``; lone-form override checks share the same client). Inherit
+#: the ASSIST list when unset, so the assist model does the stage by
+#: default — a dedicated adjudicator can be pointed at it via the env var
+#: without touching ASSIST_MODELS.
+CONSISTENCY_MODELS = _env_models(
+    "BOOK_HARNESS_CONSISTENCY_MODELS", "BOOK_HARNESS_CONSISTENCY_MODEL",
+    ASSIST_MODELS,
+)
 
 #: M5 formatting role (task 5.6): general instruct models by preference,
 #: with small generic instructs as fallback. Deliberately does NOT inherit
