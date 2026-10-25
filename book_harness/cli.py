@@ -174,8 +174,9 @@ def stage_consistency(
     path, version = glossary_mod.write_glossary(entries, out / config.GLOSSARY_FILE)
     logger.info(
         "consistency: %d entries, version %s -> %s "
-        "(chosen: %d, fallback: %d)",
-        len(entries), version, path, counts["chosen"], counts["fallback"],
+        "(chosen: %d, kept: %d, overridden: %d, fallback: %d)",
+        len(entries), version, path, counts["chosen"],
+        counts["kept"], counts["overridden"], counts["fallback"],
     )
     version, entries = glossary_mod.load_glossary(path)
     return entries, version, path

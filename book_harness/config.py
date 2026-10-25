@@ -224,7 +224,17 @@ OLLAMA_TIMEOUT = int(os.environ.get("BOOK_HARNESS_OLLAMA_TIMEOUT", "900"))
 API_DEFAULT = os.environ.get("BOOK_HARNESS_API", "auto")  # auto | ollama | openai
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-GENERATE_OPTIONS = {"temperature": 0.0, "num_ctx": 4096, "seed": 42}
+#: Base generate options for every model role. ``think: False`` is pinned
+#: here, not per-role: some assist-capable models (e.g. ``gemma4:26b``) run
+#: a thinking channel that silently eats the context window when allowed —
+#: with ``num_ctx: 4096`` the page-format prompt exhausted the window inside
+#: thinking (``done_reason: length``, empty response). Tasks are
+#: temperature-0 formatting/verdict missions, not reasoning; the Ollama
+#: client hoists ``think`` to the request top level, OpenAI-compatible
+#: servers ignore it (only ``OPENAI_OPTION_KEYS`` are forwarded).
+GENERATE_OPTIONS = {
+    "temperature": 0.0, "num_ctx": 4096, "seed": 42, "think": False,
+}
 
 # ---------------------------------------------------------------------------
 # Prompt versions (bump to invalidate the chunk cache)
@@ -726,6 +736,46 @@ CONSISTENCY_USER = (
 #: Prompt-card identity recorded in the consistency cache; bump when the
 #: prompt templates above change so cached decisions are invalidated.
 CONSISTENCY_PROMPT_ID = "consistency-v1"
+
+#: Override check for a *single-option* certified entry: several dictionaries
+#: agreeing is common, a wrong *field idiom* is rarer — but the dictionary
+#: wins on citation, not on fit. The assist model re-audits a lone certified
+#: rendering against the book's occurrences and either keeps it or overrides
+#: it with a domain-fitting rendering. The model replies ``keep`` or
+#: ``override to `ARABIC RENDERING` ``.
+CONSISTENCY_OVERRIDE_SYSTEM = (
+    "You audit one dictionary-certified Arabic translation against how the "
+    "book actually uses the term.\n"
+    "Terminology dictionaries certify forms for their own field (aviation, "
+    "military, general technology); a certified form can be idiomatic there "
+    "and wrong in this book's domain.\n"
+    "Judge only from the supplied occurrences; when in doubt, keep the "
+    "certified form.\n"
+)
+
+#: User-message template for the override check: the single certified form
+#: + its dictionary, then documented occurrences (chunk id · section · page +
+#: context window). The reply is ``keep`` or ``override to `ARABIC RENDERING` ``.
+CONSISTENCY_OVERRIDE_USER = (
+    "English technical term: {term}\n"
+    "Book domain: {domains}\n"
+    "\n"
+    "Dictionary-certified Arabic translation:\n"
+    "1. `{form}` (source: {source})\n"
+    "\n"
+    "Chunks of this book where the term occurs (with surrounding context):\n"
+    "{occurrences}\n"
+    "\n"
+    "If the certified translation fits the term's usage in these chunks, "
+    "reply exactly: keep\n"
+    "If it does not fit — for example it is a calque from another field — "
+    "override it and reply exactly: override to `ARABIC RENDERING`\n"
+    "with a single, domain-fitting Arabic rendering for this book."
+)
+
+#: Prompt-card identity for the override check; cached in the same
+#: consistency-cache.jsonl under its own key (options + this prompt id).
+CONSISTENCY_OVERRIDE_PROMPT_ID = "consistency-override-v1"
 
 #: Generate options for the consistency model. ``think`` is disabled like the
 #: extraction card: the task is picking a numbered option, not reasoning.

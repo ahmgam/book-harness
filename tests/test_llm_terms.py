@@ -262,7 +262,10 @@ class TestThinkOption:
         assert payload["think"] is False
         assert "think" not in payload["options"]
 
-    def test_ollama_omits_think_by_default(self, monkeypatch):
+    def test_ollama_pins_think_false_by_default(self, monkeypatch):
+        """PLAN: ``think: False`` is pinned in ``GENERATE_OPTIONS`` — Ollama
+        hoists it to the request top level so thinking-capable assist models
+        (gemma4:26b) can never burn the context window on a think channel."""
         from book_harness.translate import OllamaClient
 
         payloads: list[dict] = []
@@ -275,7 +278,7 @@ class TestThinkOption:
         client = OllamaClient(host="http://x")
         client.model = "some-model"
         client.generate("hi")
-        assert "think" not in payloads[0]
+        assert payloads[0]["think"] is False
         assert "think" not in payloads[0]["options"]
 
 

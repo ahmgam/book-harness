@@ -52,6 +52,23 @@ OPENAI_OPTION_KEYS = (
 # Client
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Transport helpers
+# ---------------------------------------------------------------------------
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """Human-readable reason from an HTTPError (server JSON body if any)."""
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:
+        body = ""
+    try:
+        detail = json.loads(body).get("error", body) if body else ""
+    except json.JSONDecodeError:
+        detail = body
+    return detail.strip() or str(exc.reason)
+
+
 class OllamaClient:
     """Minimal stdlib Ollama client (non-streaming generate)."""
 
@@ -74,8 +91,21 @@ class OllamaClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # server-side refusals carry a JSON body with the real reason
+            # (e.g. ``prediction aborted, token repeat limit reached``) —
+            # surface it instead of a bare "HTTP 500"
+            raise RuntimeError(
+                f"Ollama HTTP {exc.code} at {self.host}{path}: "
+                f"{_http_error_detail(exc)}"
+            ) from exc
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            raise ConnectionError(
+                f"Ollama not reachable at {self.host}: {exc}"
+            ) from exc
 
     def _get(self, path: str) -> Any:
         with urllib.request.urlopen(self.host + path, timeout=30) as resp:
@@ -244,6 +274,11 @@ class OpenAIClient:
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(
+                f"OpenAI-compatible server HTTP {exc.code} at "
+                f"{self.host}{path}: {_http_error_detail(exc)}"
+            ) from exc
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
             raise ConnectionError(
                 f"OpenAI-compatible server not reachable at {self.host}{path}: {exc}"

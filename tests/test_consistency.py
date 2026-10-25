@@ -88,7 +88,8 @@ class TestConsistency:
         entries, counts, client = _run(
             [ent], [_occ("cell")], tmp_path, replies={"cell": "2"},
         )
-        assert counts == {"chosen": 1, "fallback": 0, "skipped": 0}
+        assert counts == {"chosen": 1, "kept": 0, "overridden": 0,
+                           "fallback": 0, "skipped": 0}
         assert client.calls, "model must be consulted"
         # occurrence context reached the prompt — with the chunk reference
         prompt = client.calls[0]
@@ -187,13 +188,20 @@ class TestConsistency:
         assert counts["fallback"] == 1
         assert entries[0]["term_ar"] == "خانة"
 
-    def test_uncertified_and_single_option_skip(self, tmp_path: Path):
+    def test_uncertified_and_unoccurred_single_option_skip(
+        self, tmp_path: Path,
+    ):
+        # uncertified: nothing to decide — a lone certified form with NO
+        # documented occurrences has no usage to audit against either
         unc = _entry("quantum fizzle", None, status=STATUS_UNCERTIFIED)
         single = _entry("lift", "الرفع")
         _, counts, client = _run(
-            [unc, single], [], tmp_path, replies={"cell": "1"},
+            [unc, single], [], tmp_path, replies={"lift": "keep"},
         )
-        assert counts == {"chosen": 0, "fallback": 0, "skipped": 2}
+        assert counts["chosen"] == 0
+        assert counts["kept"] == 0
+        assert counts["overridden"] == 0
+        assert counts["skipped"] == 2
         assert not client.calls
         assert not (tmp_path / "consistency-decisions.jsonl").exists()
 
@@ -211,3 +219,142 @@ class TestConsistency:
             [ent], [_occ("cell")], tmp_path, replies={"cell": "1"},
         )
         assert "Chunks of this book where the term occurs" in client.calls[0]
+
+
+class TestOverrideCheck:
+    """Lone certified forms are re-audited against documented occurrences:
+    the model either keeps the form or overrides it with a domain-fitting
+    rendering."""
+
+    # Arabic glyphs are visually ambiguous in source — code points are the
+    # contract, so every form below is spelled out with unicode escapes.
+    FORM = "\u067a\u0627\u0631\u0629 \u0627\u0644\u062a\u062d\u0643\u0645"      # plane (certified)
+    MUSTAWEY = "\u0645\u0633\u062a\u0648\u0649 \u0627\u0644\u062a\u062d\u0643\u0645"  # control level
+    TABAQA = "\u0637\u0628\u0642\u0629 \u0627\u0644\u062a\u062d\u0643\u0645"     # control layer
+    MARQA = "\u0645\u0631\u0642\u0629 \u0627\u0644\u062d\u0627\u0644\u0629"
+    DICT = ("\u0645\u0639\u062c\u0645 \u0645\u0635\u0637\u0644\u062d\u0627\u062a"
+            " \u0627\u0644\u0639\u0644\u0645 \u0648\u0627\u0644\u062a\u0643\u0646\u0648\u0644\u0648\u062c\u064a\u0627"
+            " (\u062a.1)")
+
+    def _control_plane(self):
+        # mirrors the real glossary entry: single certified form, no
+        # alternatives — a dictionary form the book's own usage disagrees
+        # with
+        return _entry(
+            "control plane", self.FORM, source=self.DICT,
+        )
+
+    def test_override_replaces_certified_form(self, tmp_path: Path):
+        ent = self._control_plane()
+        entries, counts, client = _run(
+            [ent],
+            [_occ("control plane", chunk_id="chunk-0034", page=18,
+                  section="Chapter 2: Two control planes",
+                  context=".. as part of a behavioral control plane ..")],
+            tmp_path,
+            replies={"control plane":
+                     f"override to `{self.MUSTAWEY}`"},
+        )
+        assert counts["overridden"] == 1
+        assert counts["skipped"] == 0
+        assert client.calls and self.FORM in client.calls[0]
+        assert "behavioral control plane" in client.calls[0]
+        e = entries[0]
+        assert e["term_ar"] == self.MUSTAWEY
+        assert e["status"] == STATUS_LLM_CHOSEN
+        assert e["decided_by"] == "llm_context"
+        assert "consistency override" in e["reason"]
+        # dictionary provenance survives the override — the citation is
+        # what made it auditable
+        assert e["source"] == self.DICT
+        assert e["page"] == 7
+        log = [json.loads(ln) for ln in (
+            tmp_path / "consistency-decisions.jsonl").read_text().splitlines()]
+        assert log[0]["via"] == "override"
+        assert log[0]["prompt"] == "consistency-override-v1"
+        cache = [json.loads(ln) for ln in (
+            tmp_path / "consistency-cache.jsonl").read_text().splitlines()]
+        assert cache[0]["chosen"] == e["term_ar"]
+
+    def test_override_keep_preserves_certified_form(self, tmp_path: Path):
+        ent = self._control_plane()
+        entries, counts, client = _run(
+            [ent], [_occ("control plane")], tmp_path,
+            replies={"control plane": "keep"},
+        )
+        assert counts["kept"] == 1
+        assert counts["overridden"] == 0
+        assert client.calls
+        e = entries[0]
+        assert e["term_ar"] == self.FORM       # untouched
+        assert e["status"] == STATUS_CERTIFIED
+        assert e["decided_by"] == "auto"
+        log = [json.loads(ln) for ln in (
+            tmp_path / "consistency-decisions.jsonl").read_text().splitlines()]
+        assert log[0]["via"] == "keep"
+        assert log[0]["chosen"] == self.FORM
+
+    def test_override_keep_replays_from_cache(self, tmp_path: Path):
+        _run([self._control_plane()], [_occ("control plane")], tmp_path,
+             replies={"control plane": "keep"})
+        fresh = self._control_plane()
+
+        def boom():
+            raise AssertionError("model must not be consulted on cache hit")
+
+        entries, counts = choose_translations(
+            [fresh], [_occ("control plane")], boom, tmp_path,
+            logger=_Silent(),
+        )
+        assert counts["kept"] == 1
+        assert entries[0]["term_ar"] == self.FORM
+
+    def test_override_without_backticks_uses_first_arabic_span(
+        self, tmp_path: Path,
+    ):
+        ent = self._control_plane()
+        entries, counts, _client = _run(
+            [ent], [_occ("control plane")], tmp_path,
+            replies={"control plane": f"override to: {self.TABAQA}"},
+        )
+        assert counts["overridden"] == 1
+        assert entries[0]["term_ar"] == self.TABAQA
+
+    def test_override_claim_without_form_falls_back(self, tmp_path: Path):
+        ent = self._control_plane()
+        entries, counts, _client = _run(
+            [ent], [_occ("control plane")], tmp_path,
+            replies={"control plane": "override, it does not fit"},
+        )
+        assert counts["fallback"] == 1
+        assert counts["overridden"] == 0
+        e = entries[0]
+        assert e["term_ar"] == self.FORM       # certified kept
+        assert e["status"] == STATUS_CERTIFIED
+        assert "kept certified rendering" in e["reason"]
+        # a fallback was not a decision — it is not cached
+        assert not (tmp_path / "consistency-cache.jsonl").exists()
+
+    def test_override_reply_quoting_certified_form_keeps(self, tmp_path: Path):
+        ent = self._control_plane()
+        entries, counts, _client = _run(
+            [ent], [_occ("control plane")], tmp_path,
+            replies={"control plane": f"override to `{self.FORM}`, keep as-is"},
+        )
+        assert counts["kept"] == 1
+        assert counts["overridden"] == 0
+        assert entries[0]["term_ar"] == self.FORM
+
+    def test_llm_chosen_single_option_is_checked_too(self, tmp_path: Path):
+        # a glossary-stage LLM pick is not immune to a context mismatch
+        ent = _entry("state_db_bridge",
+                     "\u062c\u0633\u0631 \u062d\u0627\u0644\u0629",
+                     status=STATUS_LLM_CHOSEN, decided_by="llm")
+        entries, counts, _client = _run(
+            [ent], [_occ("state_db_bridge")], tmp_path,
+            replies={"state_db_bridge":
+                     f"override to `{self.MARQA}`"},
+        )
+        assert counts["overridden"] == 1
+        assert entries[0]["term_ar"] == self.MARQA
+

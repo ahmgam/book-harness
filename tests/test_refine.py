@@ -161,6 +161,21 @@ class TestVerifyPatch:
         assert half["votes"] == [True, False]
         assert half["accepted"] is False          # 1/2 votes are not enough
 
+    def test_model_failure_rejects_patch(self):
+        """Ollama aborts (HTTP 500 'token repeat limit reached') land as a
+        rejected patch, not a stage crash (PLAN: failed verify keeps draft)."""
+        class Boom:
+            def generate(self, prompt, **kw):
+                raise RuntimeError(
+                    "Ollama HTTP 500 at /api/generate: "
+                    "prediction aborted, token repeat limit reached"
+                )
+
+        verdict = verify_patch(Boom(), "src", "before", "after")
+        assert verdict["accepted"] is False
+        assert verdict["votes"] == [False, False]
+        assert "token repeat limit" in verdict["error"]
+
 
 class TestRefineChunk:
     def test_accepted_patch_lands_in_refined(self, tmp_path: Path):

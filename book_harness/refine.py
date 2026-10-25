@@ -108,6 +108,30 @@ def _single_bracket_wrap(reply: str) -> str | None:
     return None
 
 
+def _estimate_or_none(
+    client: Any,
+    source_text: str,
+    out_text: str,
+    *,
+    max_spans: int,
+    chunk_id: str,
+    uid: str,
+) -> list[dict[str, Any]]:
+    """``estimate_spans`` that degrades to "no spans" on model failure.
+
+    A failed/aborted estimate (e.g. Ollama aborts a token-repeat loop) must
+    skip the unit rather than kill the refine stage; logged with the reason.
+    """
+    try:
+        return estimate_spans(client, source_text, out_text, max_spans=max_spans)
+    except Exception as exc:
+        logger.warning(
+            "%s %s: estimate model call failed, unit skipped (%s)",
+            chunk_id, uid, exc,
+        )
+        return []
+
+
 def scrub_spans(
     spans: list[dict[str, Any]],
     text: str,
@@ -167,7 +191,12 @@ def verify_patch(
     before: str,
     after: str,
 ) -> dict[str, Any]:
-    """A/B verdict, twice, with swapped positions. Accept only on 2/2."""
+    """A/B verdict, twice, with swapped positions. Accept only on 2/2.
+
+    A model failure during an ask (e.g. Ollama aborts a degenerate
+    token-repeat loop with HTTP 500) counts as a *no* vote: the patch is not
+    verified, so it is rejected and the draft stays — never crash the stage.
+    """
     def ask(order: str) -> str:
         bodies = "\n".join(
             f"{label}:\n{body}" for label, body in zip(("A", "B"), order)
@@ -179,8 +208,13 @@ def verify_patch(
         m = re.search(r"\b([AB])\b", (reply or "").upper())
         return m.group(1) if m else "?"
 
-    vote1 = ask((before, after))          # patched translation is "B"
-    vote2 = ask((after, before))          # patched translation is "A"
+    try:
+        vote1 = ask((before, after))      # patched translation is "B"
+        vote2 = ask((after, before))      # patched translation is "A"
+    except Exception as exc:
+        logger.warning("verify_patch: model call failed, patch rejected (%s)", exc)
+        return {"votes": [False, False], "accepted": False, "tally": 0,
+                "error": str(exc)}
     votes = [vote1 == "B", vote2 == "A"]
     return {
         "votes": votes,
@@ -258,7 +292,8 @@ def refine_chunk(
         if not d or unit.get("kind") not in TRANSLATED_KINDS or not out_text.strip():
             continue
         spans, rejected = scrub_spans(
-            estimate_spans(client, unit["text"], out_text, max_spans=max_spans),
+            _estimate_or_none(client, unit["text"], out_text, max_spans=max_spans,
+                              chunk_id=chunk_id, uid=uid),
             out_text, max_spans=max_spans,
         )
         all_spans.append({"uid": uid, "raw": spans})
@@ -280,6 +315,8 @@ def refine_chunk(
                 "accepted": verdict["accepted"],
                 "votes": verdict["votes"],
             }
+            if verdict.get("error"):
+                entry["verify_error"] = verdict["error"]
             possible_patches.append(entry)
             if verdict["accepted"]:
                 cur = patched

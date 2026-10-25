@@ -207,3 +207,34 @@ class TestAssemble:
         # math passthrough survived
         assert "y" in md and "$" in md
         assert manifest["chunks_total"] == len(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Server-side refusal surfacing (HTTP 500 body → RuntimeError)
+# ---------------------------------------------------------------------------
+
+class TestHttpPostErrorDetail:
+    def test_http_error_body_surfaced(self, monkeypatch):
+        import io
+        import urllib.error
+
+        from book_harness.translate import OllamaClient, _http_error_detail
+
+        exc = urllib.error.HTTPError(
+            "http://x/api/generate", 500, "Internal Server Error", None,
+            io.BytesIO(b'{"error":"prediction aborted, token repeat limit reached"}'),
+        )
+        assert _http_error_detail(exc) == \
+            "prediction aborted, token repeat limit reached"
+
+        # direct: _post wraps a raised HTTPError with the body reason
+        def fake_urlopen(req, timeout):
+            raise urllib.error.HTTPError(
+                "http://x/api/generate", 500, "Internal Server Error", None,
+                io.BytesIO(b'{"error":"prediction aborted, token repeat limit reached"}'),
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        client = OllamaClient(host="http://x")
+        with pytest.raises(RuntimeError, match="token repeat limit"):
+            client._post("/api/generate", {"prompt": "hi"})
